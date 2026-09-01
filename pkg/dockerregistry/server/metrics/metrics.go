@@ -35,6 +35,7 @@ type Sink interface {
 	StorageErrors(funcname, errcode string) Counter
 	DigestCacheRequests(resultType string) Counter
 	DigestCacheScopedRequests(resultType string) Counter
+	NativeReadResolutions(resolution, operation string) Counter
 }
 
 // Metrics is a set of all metrics that can be provided.
@@ -43,6 +44,12 @@ type Metrics interface {
 	Pullthrough
 	Storage
 	DigestCache
+	NativeRead
+}
+
+// NativeRead is a set of metrics for the native read path.
+type NativeRead interface {
+	RecordNativeReadResolution(resolution, operation string)
 }
 
 // Core is a set of metrics for the core functionality.
@@ -182,6 +189,10 @@ func (m *metrics) DigestCacheScoped() Cache {
 	}
 }
 
+func (m *metrics) RecordNativeReadResolution(resolution, operation string) {
+	m.sink.NativeReadResolutions(resolution, operation).Inc()
+}
+
 type noopMetrics struct{}
 
 var _ Metrics = noopMetrics{}
@@ -215,3 +226,5 @@ func (m noopMetrics) DigestCache() Cache {
 func (m noopMetrics) DigestCacheScoped() Cache {
 	return noopCache{}
 }
+
+func (m noopMetrics) RecordNativeReadResolution(resolution, operation string) {}

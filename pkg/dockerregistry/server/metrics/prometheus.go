@@ -15,6 +15,7 @@ const (
 	pullthroughSubsystem = "pullthrough"
 	storageSubsystem     = "storage"
 	digestCacheSubsystem = "digest_cache"
+	nativeReadSubsystem  = "native_read"
 )
 
 var (
@@ -151,6 +152,16 @@ var (
 		},
 		[]string{"type"},
 	)
+
+	nativeReadResolutionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: nativeReadSubsystem,
+			Name:      "resolutions_total",
+			Help:      "Total number of metadata resolutions by path (native or fallback to imagestream).",
+		},
+		[]string{"resolution", "operation"},
+	)
 )
 
 var prometheusOnce sync.Once
@@ -176,6 +187,7 @@ func NewPrometheusSink() Sink {
 		prometheus.MustRegister(storageErrorsTotal)
 		prometheus.MustRegister(digestCacheRequestsTotal)
 		prometheus.MustRegister(digestCacheScopedRequestsTotal)
+		prometheus.MustRegister(nativeReadResolutionsTotal)
 	})
 	return prometheusSink{}
 }
@@ -210,4 +222,8 @@ func (s prometheusSink) DigestCacheRequests(resultType string) Counter {
 
 func (s prometheusSink) DigestCacheScopedRequests(resultType string) Counter {
 	return digestCacheScopedRequestsTotal.WithLabelValues(resultType)
+}
+
+func (s prometheusSink) NativeReadResolutions(resolution, operation string) Counter {
+	return nativeReadResolutionsTotal.WithLabelValues(resolution, operation)
 }

@@ -123,6 +123,7 @@ type Configuration struct {
 	Quota         *Quota                `yaml:"quota"`
 	Pullthrough   *Pullthrough          `yaml:"pullthrough"`
 	Compatibility *Compatibility        `yaml:"compatibility"`
+	NativeReadPath *NativeReadPath      `yaml:"nativereadpath"`
 }
 
 type Metrics struct {
@@ -171,6 +172,11 @@ type Pullthrough struct {
 
 type Compatibility struct {
 	AcceptSchema2 bool `yaml:"acceptschema2"`
+}
+
+type NativeReadPath struct {
+	Enabled   bool   `yaml:"enabled"`
+	RepoRegex string `yaml:"reporegex"`
 }
 
 type versionInfo struct {

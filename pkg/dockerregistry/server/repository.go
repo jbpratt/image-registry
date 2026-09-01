@@ -54,6 +54,10 @@ type repository struct {
 	// remoteBlobGetter is used to fetch blobs from remote registries if pullthrough is enabled.
 	remoteBlobGetter BlobGetterService
 	cache            cache.RepositoryDigest
+
+	// nativeRead is true when this repository should serve reads from
+	// native storage first, falling back to imagestream on miss.
+	nativeRead bool
 }
 
 // Repository returns a new repository middleware.
@@ -70,6 +74,8 @@ func (app *App) Repository(ctx context.Context, repo distribution.Repository, cr
 		return nil, nil, err
 	}
 
+	repoName := repo.Named().Name()
+
 	r := &repository{
 		Repository: repo,
 
@@ -82,6 +88,7 @@ func (app *App) Repository(ctx context.Context, repo distribution.Repository, cr
 		icsp:        registryOSClient.ImageContentSourcePolicy(),
 		idms:        registryOSClient.ImageDigestMirrorSet(),
 		itms:        registryOSClient.ImageTagMirrorSet(),
+		nativeRead:  app.nativeReadMatcher != nil && app.nativeReadMatcher.matches(repoName),
 	}
 
 	r.remoteBlobGetter = NewBlobGetterService(
@@ -109,7 +116,7 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 	// We do a verification of our own. We do more restrictive checks and we
 	// know about remote blobs.
 	opts := append(options, registrystorage.SkipLayerVerification())
-	ms, err := r.Repository.Manifests(ctx, opts...)
+	nativeMS, err := r.Repository.Manifests(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -119,8 +126,8 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		return nil, err
 	}
 
-	ms = &manifestService{
-		manifests:        ms,
+	imagestreamMS := &manifestService{
+		manifests:        nativeMS,
 		blobStore:        r.Blobs(ctx),
 		serverAddr:       r.app.config.Server.Addr,
 		imageStream:      r.imageStream,
@@ -129,8 +136,9 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		acceptSchema2:    r.app.config.Compatibility.AcceptSchema2,
 	}
 
+	var ms distribution.ManifestService
 	ms = &pullthroughManifestService{
-		ManifestService: ms,
+		ManifestService: imagestreamMS,
 		newLocalManifestService: func(ctx context.Context) (distribution.ManifestService, error) {
 			return r.Repository.Manifests(ctx, opts...)
 		},
@@ -142,6 +150,14 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		idms:         r.idms,
 		icsp:         r.icsp,
 		itms:         r.itms,
+	}
+
+	if r.nativeRead {
+		ms = &nativeManifestService{
+			native:   nativeMS,
+			fallback: ms,
+			metrics:  r.app.metrics,
+		}
 	}
 
 	ms = newPendingErrorsManifestService(ms, r)
@@ -189,11 +205,22 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 func (r *repository) Tags(ctx context.Context) distribution.TagService {
 	ctx = withAuthContext(ctx)
 
-	ts := r.Repository.Tags(ctx)
+	nativeTS := r.Repository.Tags(ctx)
 
-	ts = &tagService{
-		TagService:  ts,
+	imagestreamTS := &tagService{
+		TagService:  nativeTS,
 		imageStream: r.imageStream,
+	}
+
+	var ts distribution.TagService
+	if r.nativeRead {
+		ts = &nativeTagService{
+			native:   nativeTS,
+			fallback: imagestreamTS,
+			metrics:  r.app.metrics,
+		}
+	} else {
+		ts = imagestreamTS
 	}
 
 	ts = newPendingErrorsTagService(ts, r)
@@ -206,12 +233,24 @@ func (r *repository) Tags(ctx context.Context) distribution.TagService {
 }
 
 func (r *repository) BlobDescriptorService(svc distribution.BlobDescriptorService) distribution.BlobDescriptorService {
-	svc = &cache.RepositoryScopedBlobDescriptor{
+	nativeSvc := &cache.RepositoryScopedBlobDescriptor{
 		Repo:  r.Named().String(),
 		Cache: r.app.cache,
 		Svc:   svc,
 	}
-	svc = &blobDescriptorService{svc, r}
+
+	imagestreamSvc := &blobDescriptorService{nativeSvc, r}
+
+	if r.nativeRead {
+		svc = &nativeBlobDescriptorService{
+			native:   nativeSvc,
+			fallback: imagestreamSvc,
+			metrics:  r.app.metrics,
+		}
+	} else {
+		svc = imagestreamSvc
+	}
+
 	svc = newPendingErrorsBlobDescriptorService(svc, r)
 	return svc
 }

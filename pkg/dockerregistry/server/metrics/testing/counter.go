@@ -73,6 +73,12 @@ func (s counterSink) DigestCacheScopedRequests(resultType string) metrics.Counte
 	})
 }
 
+func (s counterSink) NativeReadResolutions(resolution, operation string) metrics.Counter {
+	return callbackCounter(func() {
+		s.c.Add(fmt.Sprintf("native_read_resolutions:%s:%s", resolution, operation), 1)
+	})
+}
+
 func NewCounterSink() (counter.Counter, metrics.Sink) {
 	c := counter.New()
 	return c, counterSink{c: c}

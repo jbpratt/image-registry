@@ -69,6 +69,10 @@ type App struct {
 	// paginationCache maps repository names to opaque continue tokens received from master API for subsequent
 	// list imagestreams requests
 	paginationCache *kubecache.LRUExpireCache
+
+	// nativeReadMatcher decides whether a repository uses the native (storage-backed)
+	// read path instead of the imagestream/etcd path. nil means native reads are disabled.
+	nativeReadMatcher *nativeReadMatcher
 }
 
 func (app *App) Storage(driver storagedriver.StorageDriver, options map[string]interface{}) (storagedriver.StorageDriver, error) {
@@ -113,6 +117,15 @@ func NewApp(ctx context.Context, registryClient client.RegistryClient, dockerCon
 		app.metrics = metrics.NewMetrics(metrics.NewPrometheusSink())
 	} else {
 		app.metrics = metrics.NewNoopMetrics()
+	}
+
+	if app.config.NativeReadPath != nil && app.config.NativeReadPath.Enabled {
+		matcher, err := newNativeReadMatcher(app.config.NativeReadPath.RepoRegex)
+		if err != nil {
+			dcontext.GetLogger(ctx).Fatalf("invalid native read path regex: %v", err)
+		}
+		app.nativeReadMatcher = matcher
+		dcontext.GetLogger(ctx).Infof("Native read path enabled (regex=%q)", app.config.NativeReadPath.RepoRegex)
 	}
 
 	cacheTTL := time.Duration(0)

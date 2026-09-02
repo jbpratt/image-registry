@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -13,7 +14,10 @@ import (
 	"github.com/openshift/image-registry/pkg/imagestream"
 
 	registryclient "github.com/openshift/image-registry/pkg/dockerregistry/server/client"
+	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
+	metricstesting "github.com/openshift/image-registry/pkg/dockerregistry/server/metrics/testing"
 	"github.com/openshift/image-registry/pkg/testutil"
+	"github.com/openshift/image-registry/pkg/testutil/counter"
 )
 
 func TestTagGet(t *testing.T) {
@@ -328,4 +332,100 @@ func (t *testTagService) Lookup(ctx context.Context, desc distribution.Descripto
 		}
 	}
 	return
+}
+
+type failingTagService struct {
+	distribution.TagService
+	err error
+}
+
+func (f failingTagService) Get(ctx context.Context, tag string) (distribution.Descriptor, error) {
+	return distribution.Descriptor{}, f.err
+}
+
+func TestTagGetNativeRead(t *testing.T) {
+	ctx := testutil.WithTestLogger(context.Background(), t)
+	namespace, repo, tag := "user", "app", "latest"
+
+	fos, imageClient := testutil.NewFakeOpenShiftWithClient(ctx)
+	testImage := testutil.AddRandomImage(t, fos, namespace, repo, tag)
+	imageStreamDigest := digest.Digest(testImage.Name)
+	nativeDesc := distribution.Descriptor{Digest: "sha256:native"}
+	storageErr := errors.New("s3: timeout")
+
+	for _, tc := range []struct {
+		name        string
+		native      distribution.TagService
+		tagName     string
+		wantDigest  digest.Digest
+		wantErr     error
+		wantMetrics counter.M
+	}{
+		{
+			name:        "native hit",
+			native:      newTestTagService(map[string]distribution.Descriptor{tag: nativeDesc}),
+			tagName:     tag,
+			wantDigest:  nativeDesc.Digest,
+			wantMetrics: counter.M{"native_read_resolutions:native:tag_get": 1},
+		},
+		{
+			name:        "native miss, imagestream hit",
+			native:      newTestTagService(nil),
+			tagName:     tag,
+			wantDigest:  imageStreamDigest,
+			wantMetrics: counter.M{"native_read_resolutions:fallback:tag_get": 1},
+		},
+		{
+			name:        "native miss, imagestream miss",
+			native:      newTestTagService(nil),
+			tagName:     "missing",
+			wantErr:     distribution.ErrTagUnknown{Tag: "missing"},
+			wantMetrics: counter.M{},
+		},
+		{
+			name:        "native storage error, imagestream hit",
+			native:      failingTagService{err: storageErr},
+			tagName:     tag,
+			wantDigest:  imageStreamDigest,
+			wantMetrics: counter.M{"native_read_resolutions:native_error:tag_get": 1},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, sink := metricstesting.NewCounterSink()
+			ts := tagService{
+				TagService:  tc.native,
+				imageStream: imagestream.New(ctx, namespace, repo, registryclient.NewFakeRegistryAPIClient(nil, imageClient)),
+				nativeRead:  true,
+				metrics:     metrics.NewMetrics(sink),
+			}
+
+			desc, err := ts.Get(ctx, tc.tagName)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got err %v, want %v", err, tc.wantErr)
+			}
+			if desc.Digest != tc.wantDigest {
+				t.Errorf("got digest %q, want %q", desc.Digest, tc.wantDigest)
+			}
+			if diff := c.Diff(tc.wantMetrics); diff != nil {
+				t.Errorf("unexpected metrics: %v", diff)
+			}
+		})
+	}
+}
+
+func TestTagNativeReadWritesLink(t *testing.T) {
+	ctx := context.Background()
+	desc := distribution.Descriptor{Digest: "sha256:abc"}
+
+	for _, nativeRead := range []bool{false, true} {
+		store := newTestTagService(nil)
+		ts := tagService{TagService: store, nativeRead: nativeRead}
+
+		if err := ts.Tag(ctx, "latest", desc); err != nil {
+			t.Fatalf("nativeRead=%v: unexpected error: %v", nativeRead, err)
+		}
+		if _, linked := store.data["latest"]; linked != nativeRead {
+			t.Errorf("nativeRead=%v: storage tag link written=%v", nativeRead, linked)
+		}
+	}
 }

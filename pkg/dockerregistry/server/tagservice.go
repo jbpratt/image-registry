@@ -6,6 +6,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/registry/api/v2"
 
+	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
 	"github.com/openshift/image-registry/pkg/imagestream"
 )
 
@@ -13,9 +14,37 @@ type tagService struct {
 	distribution.TagService
 
 	imageStream imagestream.ImageStream
+
+	// nativeRead serves Get from the embedded storage-backed tag store
+	// first, falling back to the imagestream on miss, and writes the
+	// storage tag link on Tag so later Gets can resolve natively. All and
+	// Lookup always use the imagestream: the storage tag store only knows
+	// about tags pushed while native reads were enabled, so a native
+	// listing is incomplete by construction.
+	nativeRead bool
+	metrics    metrics.Metrics
 }
 
 func (t tagService) Get(ctx context.Context, tag string) (distribution.Descriptor, error) {
+	if !t.nativeRead {
+		return t.imageStreamGet(ctx, tag)
+	}
+
+	desc, err := t.TagService.Get(ctx, tag)
+	if err == nil {
+		t.metrics.RecordNativeReadResolution(resolutionNative, opTagGet)
+		return desc, nil
+	}
+	resolution := nativeMissResolution(ctx, opTagGet, err)
+
+	desc, err = t.imageStreamGet(ctx, tag)
+	if err == nil {
+		t.metrics.RecordNativeReadResolution(resolution, opTagGet)
+	}
+	return desc, err
+}
+
+func (t tagService) imageStreamGet(ctx context.Context, tag string) (distribution.Descriptor, error) {
 	ok, err := t.imageStream.Exists(ctx)
 	if err != nil {
 		return distribution.Descriptor{}, err
@@ -86,7 +115,14 @@ func (t tagService) Lookup(ctx context.Context, desc distribution.Descriptor) ([
 	return tagList, nil
 }
 
+// Tag records the tag. The imagestream side is already covered by the
+// ImageStreamMapping created by the preceding manifest Put; with native
+// reads enabled the storage tag link is written as well so that Get can
+// resolve the tag without the apiserver.
 func (t tagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
+	if t.nativeRead {
+		return t.TagService.Tag(ctx, tag, desc)
+	}
 	return nil
 }
 

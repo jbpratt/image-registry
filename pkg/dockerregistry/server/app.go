@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -70,9 +71,10 @@ type App struct {
 	// list imagestreams requests
 	paginationCache *kubecache.LRUExpireCache
 
-	// nativeReadMatcher decides whether a repository uses the native (storage-backed)
-	// read path instead of the imagestream/etcd path. nil means native reads are disabled.
-	nativeReadMatcher *nativeReadMatcher
+	// nativeReadRegex selects the repositories (namespace/name) that serve
+	// tag and manifest reads from native storage before the imagestream.
+	// nil means native reads are disabled.
+	nativeReadRegex *regexp.Regexp
 }
 
 func (app *App) Storage(driver storagedriver.StorageDriver, options map[string]interface{}) (storagedriver.StorageDriver, error) {
@@ -120,11 +122,11 @@ func NewApp(ctx context.Context, registryClient client.RegistryClient, dockerCon
 	}
 
 	if app.config.NativeReadPath != nil && app.config.NativeReadPath.Enabled {
-		matcher, err := newNativeReadMatcher(app.config.NativeReadPath.RepoRegex)
+		re, err := compileNativeReadRegex(app.config.NativeReadPath.RepoRegex)
 		if err != nil {
 			dcontext.GetLogger(ctx).Fatalf("invalid native read path regex: %v", err)
 		}
-		app.nativeReadMatcher = matcher
+		app.nativeReadRegex = re
 		dcontext.GetLogger(ctx).Infof("Native read path enabled (regex=%q)", app.config.NativeReadPath.RepoRegex)
 	}
 

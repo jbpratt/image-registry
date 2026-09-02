@@ -76,8 +76,6 @@ func (app *App) Repository(ctx context.Context, repo distribution.Repository, cr
 		return nil, nil, err
 	}
 
-	repoName := repo.Named().Name()
-
 	r := &repository{
 		Repository: repo,
 
@@ -90,7 +88,7 @@ func (app *App) Repository(ctx context.Context, repo distribution.Repository, cr
 		icsp:        registryOSClient.ImageContentSourcePolicy(),
 		idms:        registryOSClient.ImageDigestMirrorSet(),
 		itms:        registryOSClient.ImageTagMirrorSet(),
-		nativeRead:  app.nativeReadMatcher != nil && app.nativeReadMatcher.matches(repoName),
+		nativeRead:  app.nativeReadRegex != nil && app.nativeReadRegex.MatchString(repo.Named().Name()),
 	}
 
 	r.remoteBlobGetter = NewBlobGetterService(
@@ -118,7 +116,7 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 	// We do a verification of our own. We do more restrictive checks and we
 	// know about remote blobs.
 	opts := append(options, registrystorage.SkipLayerVerification())
-	nativeMS, err := r.Repository.Manifests(ctx, opts...)
+	ms, err := r.Repository.Manifests(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,19 +126,20 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		return nil, err
 	}
 
-	imagestreamMS := &manifestService{
-		manifests:        nativeMS,
+	ms = &manifestService{
+		manifests:        ms,
 		blobStore:        r.Blobs(ctx),
 		serverAddr:       r.app.config.Server.Addr,
 		imageStream:      r.imageStream,
 		registryOSClient: registryOSClient,
 		cache:            r.cache,
 		acceptSchema2:    r.app.config.Compatibility.AcceptSchema2,
+		nativeRead:       r.nativeRead,
+		metrics:          r.app.metrics,
 	}
 
-	var ms distribution.ManifestService
 	ms = &pullthroughManifestService{
-		ManifestService: imagestreamMS,
+		ManifestService: ms,
 		newLocalManifestService: func(ctx context.Context) (distribution.ManifestService, error) {
 			return r.Repository.Manifests(ctx, opts...)
 		},
@@ -152,14 +151,6 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		idms:         r.idms,
 		icsp:         r.icsp,
 		itms:         r.itms,
-	}
-
-	if r.nativeRead {
-		ms = &nativeManifestService{
-			native:   nativeMS,
-			fallback: ms,
-			metrics:  r.app.metrics,
-		}
 	}
 
 	ms = newPendingErrorsManifestService(ms, r)
@@ -207,22 +198,13 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 func (r *repository) Tags(ctx context.Context) distribution.TagService {
 	ctx = withAuthContext(ctx)
 
-	nativeTS := r.Repository.Tags(ctx)
+	ts := r.Repository.Tags(ctx)
 
-	imagestreamTS := &tagService{
-		TagService:  nativeTS,
+	ts = &tagService{
+		TagService:  ts,
 		imageStream: r.imageStream,
-	}
-
-	var ts distribution.TagService
-	if r.nativeRead {
-		ts = &nativeTagService{
-			native:   nativeTS,
-			fallback: imagestreamTS,
-			metrics:  r.app.metrics,
-		}
-	} else {
-		ts = imagestreamTS
+		nativeRead:  r.nativeRead,
+		metrics:     r.app.metrics,
 	}
 
 	ts = newPendingErrorsTagService(ts, r)

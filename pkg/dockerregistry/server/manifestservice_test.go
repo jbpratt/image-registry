@@ -16,8 +16,10 @@ import (
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/cache"
 	registryclient "github.com/openshift/image-registry/pkg/dockerregistry/server/client"
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
+	metricstesting "github.com/openshift/image-registry/pkg/dockerregistry/server/metrics/testing"
 	"github.com/openshift/image-registry/pkg/imagestream"
 	"github.com/openshift/image-registry/pkg/testutil"
+	"github.com/openshift/image-registry/pkg/testutil/counter"
 )
 
 func TestManifestServiceExists(t *testing.T) {
@@ -389,6 +391,80 @@ func TestManifestServicePut(t *testing.T) {
 			_, err = ms.Get(ctx, dgst)
 			if err != nil {
 				t.Errorf("failed to get manifest with digest %q: %s", dgst, err)
+			}
+		})
+	}
+}
+
+func TestManifestServiceGetNativeRead(t *testing.T) {
+	ctx := testutil.WithTestLogger(context.Background(), t)
+	namespace, repo := "user", "app"
+	dgst := digest.Digest("sha256:abd132")
+	manifest := &schema2.DeserializedManifest{
+		Manifest: schema2.Manifest{
+			Config: distribution.Descriptor{Digest: "sha256:a1b2d", Size: 2},
+		},
+	}
+
+	for _, tc := range []struct {
+		name          string
+		nativeRead    bool
+		inStorage     bool
+		inImageStream bool
+		wantErr       bool
+		wantMetrics   counter.M
+	}{
+		{
+			name:        "native hit needs no imagestream",
+			nativeRead:  true,
+			inStorage:   true,
+			wantMetrics: counter.M{"native_read_resolutions:native:manifest_get": 1},
+		},
+		{
+			name:          "native miss falls back to imagestream path",
+			nativeRead:    true,
+			inImageStream: true,
+			wantErr:       true,
+			wantMetrics:   counter.M{},
+		},
+		{
+			name:        "disabled requires imagestream",
+			inStorage:   true,
+			wantErr:     true,
+			wantMetrics: counter.M{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fos, imageClient := testutil.NewFakeOpenShiftWithClient(ctx)
+			client := registryclient.NewFakeRegistryAPIClient(nil, imageClient)
+			if tc.inImageStream {
+				testutil.AddImageStream(t, fos, namespace, repo, nil)
+				testutil.AddImage(t, fos, &imageapiv1.Image{
+					ObjectMeta:           metav1.ObjectMeta{Name: dgst.String()},
+					DockerImageReference: "quay.io/openshift/test-image@" + dgst.String(),
+				}, namespace, repo, "latest")
+			}
+			data := map[digest.Digest]distribution.Manifest{}
+			if tc.inStorage {
+				data[dgst] = manifest
+			}
+
+			c, sink := metricstesting.NewCounterSink()
+			ms := &manifestService{
+				manifests:        newTestManifestService(namespace+"/"+repo, data),
+				imageStream:      imagestream.New(ctx, namespace, repo, client),
+				registryOSClient: client,
+				acceptSchema2:    true,
+				nativeRead:       tc.nativeRead,
+				metrics:          metrics.NewMetrics(sink),
+			}
+
+			_, err := ms.Get(ctx, dgst)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("got err %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := c.Diff(tc.wantMetrics); diff != nil {
+				t.Errorf("unexpected metrics: %v", diff)
 			}
 		})
 	}

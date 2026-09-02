@@ -17,6 +17,7 @@ import (
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/cache"
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/client"
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/manifesthandler"
+	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
 	"github.com/openshift/image-registry/pkg/imagestream"
 )
 
@@ -33,6 +34,15 @@ type manifestService struct {
 
 	// acceptSchema2 allows to refuse the manifest schema version 2
 	acceptSchema2 bool
+
+	// nativeRead serves Get from the storage-backed manifest store first,
+	// falling back to the imagestream path on miss. Known consequence: a
+	// manifest with a revision link in this repository is served natively
+	// even after every imagestream reference to it has been removed (oc tag
+	// -d, istag delete) and until pruning removes the link; the imagestream
+	// path would return 404 in that window. See NATIVE-READ-POC.md.
+	nativeRead bool
+	metrics    metrics.Metrics
 }
 
 // Exists returns true if the manifest specified by dgst exists.
@@ -57,6 +67,25 @@ func (m *manifestService) Exists(ctx context.Context, dgst digest.Digest) (bool,
 func (m *manifestService) Get(ctx context.Context, dgst digest.Digest, options ...distribution.ManifestServiceOption) (distribution.Manifest, error) {
 	dcontext.GetLogger(ctx).Debugf("(*manifestService).Get")
 
+	if !m.nativeRead {
+		return m.imageStreamGet(ctx, dgst, options...)
+	}
+
+	manifest, err := m.manifests.Get(ctx, dgst, options...)
+	if err == nil {
+		m.metrics.RecordNativeReadResolution(resolutionNative, opManifestGet)
+		return manifest, nil
+	}
+	resolution := nativeMissResolution(ctx, opManifestGet, err)
+
+	manifest, err = m.imageStreamGet(ctx, dgst, options...)
+	if err == nil {
+		m.metrics.RecordNativeReadResolution(resolution, opManifestGet)
+	}
+	return manifest, err
+}
+
+func (m *manifestService) imageStreamGet(ctx context.Context, dgst digest.Digest, options ...distribution.ManifestServiceOption) (distribution.Manifest, error) {
 	image, rErr := m.imageStream.GetImageOfImageStream(ctx, dgst)
 	if rErr != nil {
 		switch rErr.Code() {

@@ -112,18 +112,18 @@ type openshiftConfig struct {
 }
 
 type Configuration struct {
-	Version       configuration.Version `yaml:"version"`
-	Metrics       Metrics               `yaml:"metrics"`
-	Requests      Requests              `yaml:"requests"`
-	KubeConfig    string                `yaml:"kubeconfig"`
-	Server        *Server               `yaml:"server"`
-	Auth          *Auth                 `yaml:"auth"`
-	Audit         *Audit                `yaml:"audit"`
-	Cache         *Cache                `yaml:"cache"`
-	Quota         *Quota                `yaml:"quota"`
-	Pullthrough   *Pullthrough          `yaml:"pullthrough"`
-	Compatibility *Compatibility        `yaml:"compatibility"`
-	NativeReadPath *NativeReadPath      `yaml:"nativereadpath"`
+	Version        configuration.Version `yaml:"version"`
+	Metrics        Metrics               `yaml:"metrics"`
+	Requests       Requests              `yaml:"requests"`
+	KubeConfig     string                `yaml:"kubeconfig"`
+	Server         *Server               `yaml:"server"`
+	Auth           *Auth                 `yaml:"auth"`
+	Audit          *Audit                `yaml:"audit"`
+	Cache          *Cache                `yaml:"cache"`
+	Quota          *Quota                `yaml:"quota"`
+	Pullthrough    *Pullthrough          `yaml:"pullthrough"`
+	Compatibility  *Compatibility        `yaml:"compatibility"`
+	NativeReadPath *NativeReadPath       `yaml:"nativereadpath"`
 }
 
 type Metrics struct {

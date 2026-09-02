@@ -2,21 +2,32 @@ package server
 
 import (
 	"context"
+	"errors"
 	"regexp"
 
 	"github.com/distribution/distribution/v3"
 	dcontext "github.com/distribution/distribution/v3/context"
+	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
 
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
 )
 
+// Resolution label values for the native read metric.
+//
+//   - native: served from distribution's storage layout, no apiserver call.
+//   - fallback: native lookup missed (content absent from storage), served
+//     via the imagestream path.
+//   - native_error: native lookup failed for a reason other than a miss
+//     (storage outage, permission, I/O); served via the imagestream path.
+//     A rising native_error rate means storage is degraded, not that the
+//     content lives only in etcd.
 const (
-	resolutionNative   = "native"
-	resolutionFallback = "fallback"
+	resolutionNative      = "native"
+	resolutionFallback    = "fallback"
+	resolutionNativeError = "native_error"
 
 	opTagGet        = "tag_get"
-	opTagAll        = "tag_all"
 	opManifestGet   = "manifest_get"
 	opManifestExist = "manifest_exists"
 	opBlobStat      = "blob_stat"
@@ -27,11 +38,13 @@ type nativeReadMatcher struct {
 	regex *regexp.Regexp
 }
 
+// newNativeReadMatcher compiles pattern as a full-string match against the
+// repository name (namespace/name). An empty pattern matches every repository.
 func newNativeReadMatcher(pattern string) (*nativeReadMatcher, error) {
 	if pattern == "" {
 		return &nativeReadMatcher{}, nil
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := regexp.Compile("^(?:" + pattern + ")$")
 	if err != nil {
 		return nil, err
 	}
@@ -45,13 +58,58 @@ func (m *nativeReadMatcher) matches(repoName string) bool {
 	return m.regex.MatchString(repoName)
 }
 
-// nativeTagService tries the upstream (storage-backed) tag service first,
-// falling back to the imagestream tag service on miss.
+// isNativeMiss reports whether err from the storage-backed services means
+// "not present in storage" as opposed to a storage failure.
+func isNativeMiss(err error) bool {
+	var (
+		tagUnknown      distribution.ErrTagUnknown
+		manifestUnknown distribution.ErrManifestUnknown
+		revisionUnknown distribution.ErrManifestUnknownRevision
+		repoUnknown     distribution.ErrRepositoryUnknown
+		pathNotFound    storagedriver.PathNotFoundError
+	)
+	switch {
+	case errors.Is(err, distribution.ErrBlobUnknown),
+		errors.As(err, &tagUnknown),
+		errors.As(err, &manifestUnknown),
+		errors.As(err, &revisionUnknown),
+		errors.As(err, &repoUnknown),
+		errors.As(err, &pathNotFound):
+		return true
+	}
+	return false
+}
+
+// recordNativeFailure classifies a native lookup failure, logs it, and
+// returns the resolution label to record if the fallback then succeeds.
+func recordNativeFailure(ctx context.Context, op string, err error) string {
+	if isNativeMiss(err) {
+		dcontext.GetLogger(ctx).Debugf("native read %s: miss, falling back to imagestream: %v", op, err)
+		return resolutionFallback
+	}
+	dcontext.GetLogger(ctx).Warnf("native read %s: storage error, falling back to imagestream: %v", op, err)
+	return resolutionNativeError
+}
+
+// nativeTagService serves Get from the storage-backed tag store first and
+// falls back to the imagestream tag service on miss.
+//
+// All and Lookup always use the imagestream: the storage tag store only
+// knows about tags pushed through this registry while native reads were
+// enabled, so a native listing is incomplete by construction. Neither is on
+// the pull hot path.
+//
+// Tag is dual-written: the imagestream mapping is created by the manifest
+// Put that precedes it, and the storage tag link is written here so that
+// subsequent Get calls can resolve natively. Untag stays a no-op on both
+// sides, matching the existing imagestream behaviour.
 type nativeTagService struct {
 	native   distribution.TagService
 	fallback distribution.TagService
 	metrics  metrics.Metrics
 }
+
+var _ distribution.TagService = &nativeTagService{}
 
 func (t *nativeTagService) Get(ctx context.Context, tag string) (distribution.Descriptor, error) {
 	desc, err := t.native.Get(ctx, tag)
@@ -59,26 +117,16 @@ func (t *nativeTagService) Get(ctx context.Context, tag string) (distribution.De
 		t.metrics.RecordNativeReadResolution(resolutionNative, opTagGet)
 		return desc, nil
 	}
-	dcontext.GetLogger(ctx).Debugf("nativeTagService.Get: native miss for tag %q, falling back to imagestream: %v", tag, err)
+	resolution := recordNativeFailure(ctx, opTagGet, err)
 	desc, err = t.fallback.Get(ctx, tag)
 	if err == nil {
-		t.metrics.RecordNativeReadResolution(resolutionFallback, opTagGet)
+		t.metrics.RecordNativeReadResolution(resolution, opTagGet)
 	}
 	return desc, err
 }
 
 func (t *nativeTagService) All(ctx context.Context) ([]string, error) {
-	tags, err := t.native.All(ctx)
-	if err == nil && len(tags) > 0 {
-		t.metrics.RecordNativeReadResolution(resolutionNative, opTagAll)
-		return tags, nil
-	}
-	dcontext.GetLogger(ctx).Debugf("nativeTagService.All: native returned %d tags (err=%v), falling back to imagestream", len(tags), err)
-	tags, err = t.fallback.All(ctx)
-	if err == nil {
-		t.metrics.RecordNativeReadResolution(resolutionFallback, opTagAll)
-	}
-	return tags, err
+	return t.fallback.All(ctx)
 }
 
 func (t *nativeTagService) Lookup(ctx context.Context, desc distribution.Descriptor) ([]string, error) {
@@ -86,21 +134,31 @@ func (t *nativeTagService) Lookup(ctx context.Context, desc distribution.Descrip
 }
 
 func (t *nativeTagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
-	return t.fallback.Tag(ctx, tag, desc)
+	if err := t.fallback.Tag(ctx, tag, desc); err != nil {
+		return err
+	}
+	return t.native.Tag(ctx, tag, desc)
 }
 
 func (t *nativeTagService) Untag(ctx context.Context, tag string) error {
 	return t.fallback.Untag(ctx, tag)
 }
 
-// nativeManifestService tries the upstream (storage-backed) manifest service first
-// for reads, falling back to the imagestream manifest service on miss.
-// Writes always go through the fallback (imagestream) path.
+// nativeManifestService serves Get and Exists from the storage-backed
+// manifest store first and falls back to the imagestream manifest service on
+// miss. Writes always go through the fallback path.
+//
+// Known consequence: a manifest that has a revision link in this repository
+// is served natively even after every imagestream reference to it has been
+// removed (oc tag -d, istag delete) and until pruning removes the link. The
+// imagestream path would return 404 in that window. See NATIVE-READ-POC.md.
 type nativeManifestService struct {
 	native   distribution.ManifestService
 	fallback distribution.ManifestService
 	metrics  metrics.Metrics
 }
+
+var _ distribution.ManifestService = &nativeManifestService{}
 
 func (m *nativeManifestService) Exists(ctx context.Context, dgst digest.Digest) (bool, error) {
 	exists, err := m.native.Exists(ctx, dgst)
@@ -108,10 +166,13 @@ func (m *nativeManifestService) Exists(ctx context.Context, dgst digest.Digest) 
 		m.metrics.RecordNativeReadResolution(resolutionNative, opManifestExist)
 		return true, nil
 	}
-	dcontext.GetLogger(ctx).Debugf("nativeManifestService.Exists: native miss for %s, falling back to imagestream: %v", dgst, err)
+	resolution := resolutionFallback
+	if err != nil {
+		resolution = recordNativeFailure(ctx, opManifestExist, err)
+	}
 	exists, err = m.fallback.Exists(ctx, dgst)
 	if err == nil && exists {
-		m.metrics.RecordNativeReadResolution(resolutionFallback, opManifestExist)
+		m.metrics.RecordNativeReadResolution(resolution, opManifestExist)
 	}
 	return exists, err
 }
@@ -122,10 +183,10 @@ func (m *nativeManifestService) Get(ctx context.Context, dgst digest.Digest, opt
 		m.metrics.RecordNativeReadResolution(resolutionNative, opManifestGet)
 		return manifest, nil
 	}
-	dcontext.GetLogger(ctx).Debugf("nativeManifestService.Get: native miss for %s, falling back to imagestream: %v", dgst, err)
+	resolution := recordNativeFailure(ctx, opManifestGet, err)
 	manifest, err = m.fallback.Get(ctx, dgst, options...)
 	if err == nil {
-		m.metrics.RecordNativeReadResolution(resolutionFallback, opManifestGet)
+		m.metrics.RecordNativeReadResolution(resolution, opManifestGet)
 	}
 	return manifest, err
 }
@@ -136,34 +197,4 @@ func (m *nativeManifestService) Put(ctx context.Context, manifest distribution.M
 
 func (m *nativeManifestService) Delete(ctx context.Context, dgst digest.Digest) error {
 	return m.fallback.Delete(ctx, dgst)
-}
-
-// nativeBlobDescriptorService tries the native layer link stat first,
-// falling back to the imagestream-backed stat on miss.
-type nativeBlobDescriptorService struct {
-	native   distribution.BlobDescriptorService
-	fallback distribution.BlobDescriptorService
-	metrics  metrics.Metrics
-}
-
-func (bs *nativeBlobDescriptorService) Stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {
-	desc, err := bs.native.Stat(ctx, dgst)
-	if err == nil {
-		bs.metrics.RecordNativeReadResolution(resolutionNative, opBlobStat)
-		return desc, nil
-	}
-	dcontext.GetLogger(ctx).Debugf("nativeBlobDescriptorService.Stat: native miss for %s, falling back: %v", dgst, err)
-	desc, err = bs.fallback.Stat(ctx, dgst)
-	if err == nil {
-		bs.metrics.RecordNativeReadResolution(resolutionFallback, opBlobStat)
-	}
-	return desc, err
-}
-
-func (bs *nativeBlobDescriptorService) SetDescriptor(ctx context.Context, dgst digest.Digest, desc distribution.Descriptor) error {
-	return bs.fallback.SetDescriptor(ctx, dgst, desc)
-}
-
-func (bs *nativeBlobDescriptorService) Clear(ctx context.Context, dgst digest.Digest) error {
-	return bs.fallback.Clear(ctx, dgst)
 }

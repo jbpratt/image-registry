@@ -37,9 +37,13 @@ type blobDescriptorService struct {
 func (bs *blobDescriptorService) Stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {
 	dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: starting with digest=%s", dgst.String())
 
-	// if there is a repo layer link, return its descriptor
+	// If there is a repo layer link, return its descriptor. This is the
+	// native read path for blobs: it never touches the apiserver. The
+	// resolution metric below is recorded unconditionally so that the
+	// link-miss rate can be measured with or without the native read flag.
 	desc, err := bs.BlobDescriptorService.Stat(ctx, dgst)
 	if err == nil {
+		bs.repo.app.metrics.RecordNativeReadResolution(resolutionNative, opBlobStat)
 		return desc, nil
 	}
 	dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: could not stat layer link %s in repository %s: %v", dgst.String(), bs.repo.Named().Name(), err)
@@ -68,6 +72,7 @@ func (bs *blobDescriptorService) Stat(ctx context.Context, dgst digest.Digest) (
 		dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: blob %s is neither empty nor referenced in image stream %s", dgst.String(), bs.repo.Named().Name())
 		return distribution.Descriptor{}, distribution.ErrBlobUnknown
 	}
+	bs.repo.app.metrics.RecordNativeReadResolution(resolutionFallback, opBlobStat)
 
 	if layers != nil {
 		// remember all the layers of matching image

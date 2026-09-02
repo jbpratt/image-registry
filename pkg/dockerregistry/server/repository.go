@@ -55,8 +55,10 @@ type repository struct {
 	remoteBlobGetter BlobGetterService
 	cache            cache.RepositoryDigest
 
-	// nativeRead is true when this repository should serve reads from
-	// native storage first, falling back to imagestream on miss.
+	// nativeRead is true when this repository should serve tag and manifest
+	// reads from native storage first, falling back to imagestream on miss.
+	// Blob descriptor Stat is already storage-first regardless of this flag;
+	// see blobDescriptorService.Stat.
 	nativeRead bool
 }
 
@@ -233,24 +235,12 @@ func (r *repository) Tags(ctx context.Context) distribution.TagService {
 }
 
 func (r *repository) BlobDescriptorService(svc distribution.BlobDescriptorService) distribution.BlobDescriptorService {
-	nativeSvc := &cache.RepositoryScopedBlobDescriptor{
+	svc = &cache.RepositoryScopedBlobDescriptor{
 		Repo:  r.Named().String(),
 		Cache: r.app.cache,
 		Svc:   svc,
 	}
-
-	imagestreamSvc := &blobDescriptorService{nativeSvc, r}
-
-	if r.nativeRead {
-		svc = &nativeBlobDescriptorService{
-			native:   nativeSvc,
-			fallback: imagestreamSvc,
-			metrics:  r.app.metrics,
-		}
-	} else {
-		svc = imagestreamSvc
-	}
-
+	svc = &blobDescriptorService{svc, r}
 	svc = newPendingErrorsBlobDescriptorService(svc, r)
 	return svc
 }

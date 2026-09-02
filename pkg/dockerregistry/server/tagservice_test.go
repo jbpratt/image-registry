@@ -312,6 +312,14 @@ func (t *testTagService) All(ctx context.Context) (tags []string, err error) {
 	return
 }
 
+func (t *testTagService) List(ctx context.Context, limit int, last string) (tags []string, err error) {
+	t.calls["List"]++
+	for tag := range t.data {
+		tags = append(tags, tag)
+	}
+	return
+}
+
 func (t *testTagService) Lookup(ctx context.Context, desc distribution.Descriptor) (tags []string, err error) {
 	t.calls["Lookup"]++
 	for tag := range t.data {

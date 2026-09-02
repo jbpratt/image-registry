@@ -29,6 +29,8 @@ const (
 	// openShiftDockerRegistryURLEnvVar is an optional environment that overrides the
 	// DOCKER_REGISTRY_URL.
 	// DEPRECATED: Use the REGISTRY_OPENSHIFT_SERVER_ADDR instead.
+	openShiftMiddlewareEnvPrefix = "REGISTRY_MIDDLEWARE_REPOSITORY_OPENSHIFT_"
+
 	openShiftDockerRegistryURLEnvVar = "REGISTRY_MIDDLEWARE_REPOSITORY_OPENSHIFT_DOCKERREGISTRYURL"
 
 	// enforceQuotaEnvVar is a boolean environment variable that allows to turn quota enforcement on or off.
@@ -196,6 +198,14 @@ func Parse(rd io.Reader) (*configuration.Configuration, *Configuration, error) {
 		return nil, nil, err
 	}
 
+	// The upstream parser rejects environment variables that address the
+	// middleware lists by name instead of by index, so hide our own
+	// middleware variables from it and restore them for InitExtraConfig.
+	middlewareEnv, err := popEnv(openShiftMiddlewareEnvPrefix)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	dockerConfig, err := configuration.Parse(bytes.NewBuffer(in))
 	if err != nil {
 		return nil, nil, err
@@ -236,6 +246,9 @@ func Parse(rd io.Reader) (*configuration.Configuration, *Configuration, error) {
 		return nil, nil, err
 	}
 	if err := pushEnv(dockerEnv); err != nil {
+		return nil, nil, err
+	}
+	if err := pushEnv(middlewareEnv); err != nil {
 		return nil, nil, err
 	}
 

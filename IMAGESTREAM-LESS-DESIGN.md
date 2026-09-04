@@ -365,3 +365,81 @@ Summary and the work that remains open after the decisions:
 repo, unchanged from §2f): expose the config knob, stop depending on ImageStream
 RBAC + the image API being present, ship the §2b-C ClusterRoles if C is chosen,
 and not gate the registry Deployment on `image.openshift.io` discovery.
+
+## 5. POC results (CRC, 2026-09-04)
+
+The minimal POC (§3) was implemented behind `openshift.imagestreams.enabled`
+(default true) and run two ways against a locally built `dockerregistry`: a
+standalone run with **no kubeconfig**, and a run with `KUBECONFIG` pointed at CRC
+(OpenShift 4.20.1). Config: `auth: { htpasswd: … }` (§2b-D), filesystem storage in
+a scratch dir, `openshift.pullthrough.enabled: false`, `openshift.imagestreams.enabled:
+false`. Feature footprint: 244 / -77 non-test Go lines across configuration.go,
+app.go, repository.go, manifestservice.go, tagservice.go, blobdescriptorservice.go.
+
+### What works
+
+`podman` push/pull round-trips with the image API disabled and never used. Exact
+commands and outcomes (standalone run, `KUBECONFIG` unset, storage on filesystem):
+
+```
+podman login 127.0.0.1:5000 --tls-verify=false -u testuser -p testpass   # Login Succeeded!
+podman tag quay.io/prometheus/busybox:latest 127.0.0.1:5000/edge/app:v1
+podman tag quay.io/prometheus/busybox:latest 127.0.0.1:5000/edge/app:v2
+podman push --tls-verify=false 127.0.0.1:5000/edge/app:v1                 # Writing manifest … ok
+podman push --tls-verify=false 127.0.0.1:5000/edge/app:v2                 # ok
+podman rmi -f …:v1 …:v2 quay.io/prometheus/busybox:latest                 # force real pulls
+podman pull --tls-verify=false 127.0.0.1:5000/edge/app:v1                 # ok
+podman pull --tls-verify=false 127.0.0.1:5000/edge/app:v2                 # ok
+podman pull --tls-verify=false 127.0.0.1:5000/edge/app@sha256:afa3f29…8e  # pull by digest, ok
+curl -u … http://127.0.0.1:5000/v2/edge/app/tags/list                    # {"name":"edge/app","tags":["v1","v2"]}
+curl -X DELETE …/manifests/v1        # 202  (tagService.Untag → native link delete)
+curl …/manifests/v1                  # 404  (tag gone)
+curl …/manifests/v2                  # 200  (other tag survives)
+curl …/manifests/sha256:afa3f29…8e   # 200  (manifest still referenced by v2)
+curl …/tags/list                     # {"…","tags":["v2"]}
+curl -X DELETE …/manifests/v2        # 202
+curl -X DELETE …/manifests/sha256:afa3f29…8e   # 202  (manifestService.Delete → native)
+curl …/manifests/sha256:afa3f29…8e   # 404  (no ghost)
+curl …/tags/list                     # {"…","tags":null}
+```
+
+The registry logs `ImageStream integration disabled (edge / ImageStream-less
+profile)` and starts with no kubeconfig at all.
+
+### What does not / caveats
+
+- **One fix was required for the pull path:** the registry unconditionally
+  advertised `X-Registry-Supports-Signatures: 1`, so `podman`/`skopeo` probed the
+  (now-unregistered) signature extension endpoint and failed the pull with a 404.
+  The header and the signature handler are now both gated off when imagestreams
+  are disabled (signatures move to referrers per §2d anyway).
+- **`oc` ImageStream tooling is gone** as designed (§2a-A): no istag/import/trigger.
+- **Referrers, GC, quota, pullthrough** are out of the POC (§2c-C, §2d) and untested.
+
+### Zero image.openshift.io calls — evidence
+
+- Standalone (no kubeconfig): the whole push/pull/list/delete cycle succeeds; the
+  registry cannot reach any apiserver, so the image API is provably unused.
+- CRC-connected (`KUBECONFIG` = `system:admin`, flag on): push/pull succeed; the
+  registry log shows **no** dial to `api.crc.testing:6443` and no image/SAR
+  activity. Sampled `openshift-apiserver/audit.log` (via `oc adm node-logs
+  --role=master`) for the push/pull window: 15 `image.openshift.io` entries, **all**
+  from system controllers (cluster-version, controller-manager, kube-controller
+  -manager, cluster-image-registry-operator — verbs get/watch on imagestreams/
+  images), **zero** from the registry identity and **zero** create/update on
+  `imagestreammappings`/`images`. (Audit captures image verbs generally: 50k+
+  `get` recorded outside the window.)
+
+### Kill-criteria status (§3)
+
+1. **Byte-for-byte native round-trip, zero image verbs** — *not triggered.* Push
+   digest `sha256:afa3f29…8e` pulled back identically by tag and by digest;
+   `tags/list` native; audit shows zero registry image verbs.
+2. **Delete leaves a servable ghost** — *not triggered.* Tag delete (Untag)
+   isolates one tag; manifest delete by digest then returns 404 with no residual.
+3. **Auth unworkable off ImageStreams** — *not triggered.* htpasswd (§2b-D) proves
+   the data path with no kube-authz dependency; `checkPendingErrors` is a no-op in
+   this mode so the openshift access controller is not required.
+4. **`registry garbage-collect` cannot reclaim** — *not evaluated.* GC is native
+   distribution behavior over `_manifests`/`_layers`; reclaim was not exercised in
+   this push/pull POC and remains a follow-on to verify.

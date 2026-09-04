@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"regexp"
 	"time"
@@ -90,6 +91,13 @@ func (app *App) Storage(driver storagedriver.StorageDriver, options map[string]i
 
 func (app *App) Registry(nm distribution.Namespace, options map[string]interface{}) (distribution.Namespace, error) {
 	app.registry = nm
+	// The ImageStream-backed enumerator lists /v2/_catalog from the image API
+	// via userClient. In the ImageStream-less profile there is no image client,
+	// so skip the override and let distribution's native storage-backed catalog
+	// (Namespace.Repositories walking _manifests) serve /v2/_catalog.
+	if app.imageStreamsDisabled {
+		return nm, nil
+	}
 	return &registry{
 		registry:   nm,
 		enumerator: NewCachingRepositoryEnumerator(app.registryClient, app.paginationCache),
@@ -107,6 +115,16 @@ func (app *App) CacheProvider(ctx context.Context, options map[string]interface{
 	return &cache.Provider{
 		Cache: app.cache,
 	}, nil
+}
+
+// validateImageStreamlessAuth rejects the openshift auth backend when
+// imagestreams are disabled. The openshift access controller depends on the
+// image API, so its authorization would be silently bypassed in that profile.
+func validateImageStreamlessAuth(authType string) error {
+	if authType == supermiddleware.Name {
+		return fmt.Errorf("openshift.imagestreams.enabled=false requires a non-openshift auth backend (htpasswd, token, none); the openshift access controller depends on the image API")
+	}
+	return nil
 }
 
 // NewApp configures the registry application and returns http.Handler for it.
@@ -129,6 +147,14 @@ func NewApp(ctx context.Context, registryClient client.RegistryClient, dockerCon
 
 	app.imageStreamsDisabled = app.config.ImageStreams != nil && !app.config.ImageStreams.Enabled
 	if app.imageStreamsDisabled {
+		// This startup check is the invariant that makes the checkPendingErrors
+		// bypass safe: the openshift access controller sets authPerformed,
+		// deferred SAR errors, and the userClient that checkPendingErrors relies
+		// on, none of which exist when imagestreams are disabled. Pairing that
+		// no-op bypass with openshift auth would silently skip authorization.
+		if err := validateImageStreamlessAuth(dockerConfig.Auth.Type()); err != nil {
+			dcontext.GetLogger(ctx).Fatalf("%v", err)
+		}
 		dcontext.GetLogger(ctx).Infof("ImageStream integration disabled (edge / ImageStream-less profile): native storage only, no image.openshift.io client")
 	}
 

@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/distribution/distribution/v3"
 	dockercfg "github.com/distribution/distribution/v3/configuration"
 	"github.com/distribution/distribution/v3/registry/storage"
+	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -32,6 +34,20 @@ func (panicRegistryClient) Client() (registryclient.Interface, error) {
 
 func (panicRegistryClient) ClientFromToken(string) (registryclient.Interface, error) {
 	panic("registryClient.ClientFromToken() must not be called when imagestreams are disabled")
+}
+
+// TestValidateImageStreamlessAuth checks the startup invariant: with
+// imagestreams disabled, openshift auth is rejected while non-openshift
+// backends are accepted.
+func TestValidateImageStreamlessAuth(t *testing.T) {
+	if err := validateImageStreamlessAuth(supermiddleware.Name); err == nil {
+		t.Error("openshift auth with imagestreams disabled: got nil, want error")
+	}
+	for _, authType := range []string{"htpasswd", "token", "none", ""} {
+		if err := validateImageStreamlessAuth(authType); err != nil {
+			t.Errorf("%q auth with imagestreams disabled: got %v, want nil", authType, err)
+		}
+	}
 }
 
 // TestManifestServicePutImageStreamsDisabledSkipsISM checks that a manifest Put
@@ -193,6 +209,51 @@ func TestTagServiceImageStreamsDisabledTagFailsPush(t *testing.T) {
 	}
 	if err := ts.Tag(ctx, "latest", distribution.Descriptor{Digest: "sha256:abc"}); err == nil {
 		t.Fatal("Tag returned nil on native write failure, want the error propagated")
+	}
+}
+
+// TestCatalogImageStreamsDisabledNative checks that /v2/_catalog does not
+// install the ImageStream enumerator when imagestreams are disabled: with a
+// registry client that panics on use, listing repositories serves distribution's
+// native storage-backed catalog (empty here) instead of hitting the image API.
+func TestCatalogImageStreamsDisabledNative(t *testing.T) {
+	ctx := testutil.WithTestLogger(context.Background(), t)
+
+	digestCache, err := cache.NewBlobDigest(
+		defaultDescriptorCacheSize,
+		defaultDigestToRepositoryCacheSize,
+		24*time.Hour,
+		metrics.NewNoopMetrics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		registryClient:       panicRegistryClient{},
+		config:               &configuration.Configuration{ImageStreams: &configuration.ImageStreams{Enabled: false}},
+		cache:                digestCache,
+		metrics:              metrics.NewNoopMetrics(),
+		paginationCache:      kubecache.NewLRUExpireCache(128),
+		imageStreamsDisabled: true,
+	}
+
+	reg, err := supermiddleware.NewRegistry(ctx, app, inmemory.New(), storage.EnableDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No userClient on the context: the ImageStream enumerator would fall back
+	// to registryClient.Client() and panic. The native catalog must not. An
+	// empty store yields io.EOF or PathNotFound, both of which distribution's
+	// catalog handler renders as an empty repository list.
+	repos := make([]string, 10)
+	n, err := reg.Repositories(ctx, repos, "")
+	if _, pathNotFound := err.(storagedriver.PathNotFoundError); err != nil && err != io.EOF && !pathNotFound {
+		t.Fatalf("Repositories: %s", err)
+	}
+	if n != 0 {
+		t.Errorf("Repositories returned %d entries from an empty store, want 0", n)
 	}
 }
 

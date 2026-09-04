@@ -392,6 +392,7 @@ podman pull --tls-verify=false 127.0.0.1:5000/edge/app:v1                 # ok
 podman pull --tls-verify=false 127.0.0.1:5000/edge/app:v2                 # ok
 podman pull --tls-verify=false 127.0.0.1:5000/edge/app@sha256:afa3f29…8e  # pull by digest, ok
 curl -u … http://127.0.0.1:5000/v2/edge/app/tags/list                    # {"name":"edge/app","tags":["v1","v2"]}
+curl -u … http://127.0.0.1:5000/v2/_catalog                              # {"repositories":["edge/app"]}  (native storage catalog, no image API)
 curl -X DELETE …/manifests/v1        # 202  (tagService.Untag → native link delete)
 curl …/manifests/v1                  # 404  (tag gone)
 curl …/manifests/v2                  # 200  (other tag survives)
@@ -404,7 +405,10 @@ curl …/tags/list                     # {"…","tags":null}
 ```
 
 The registry logs `ImageStream integration disabled (edge / ImageStream-less
-profile)` and starts with no kubeconfig at all.
+profile)` and starts with no kubeconfig at all. Startup also rejects the unsafe
+combination of `openshift.imagestreams.enabled: false` with `auth: openshift`
+(the access controller's SAR checks would be silently bypassed): it exits fatal
+with `openshift.imagestreams.enabled=false requires a non-openshift auth backend`.
 
 ### What does not / caveats
 

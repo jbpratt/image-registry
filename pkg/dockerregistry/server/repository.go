@@ -255,7 +255,9 @@ func (r *repository) checkPendingErrors(ctx context.Context) error {
 	// The authPerformed marker, deferred errors, and userClient are all
 	// populated by the OpenShift access controller. In the ImageStream-less
 	// profile a non-openshift auth backend (htpasswd/none) is in use and never
-	// sets them, and r.imageStream is nil, so there is nothing to check.
+	// sets them, and r.imageStream is nil, so there is nothing to check. The
+	// NewApp startup check rejects openshift auth when imagestreams are
+	// disabled, so this bypass can never coexist with the access controller.
 	if r.imageStreamsDisabled {
 		return nil
 	}

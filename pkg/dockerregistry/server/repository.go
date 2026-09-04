@@ -16,6 +16,7 @@ import (
 
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/audit"
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/cache"
+	"github.com/openshift/image-registry/pkg/dockerregistry/server/client"
 	"github.com/openshift/image-registry/pkg/imagestream"
 )
 
@@ -60,46 +61,56 @@ type repository struct {
 	// Blob descriptor Stat is already storage-first regardless of this flag;
 	// see blobDescriptorService.Stat.
 	nativeRead bool
+
+	// imageStreamsDisabled mirrors App.imageStreamsDisabled. When set, this
+	// repository has no imageStream/registryOSClient/pullthrough wiring and
+	// serves reads and writes from native storage only.
+	imageStreamsDisabled bool
 }
 
 // Repository returns a new repository middleware.
 func (app *App) Repository(ctx context.Context, repo distribution.Repository, crossmount bool) (distribution.Repository, distribution.BlobDescriptorServiceFactory, error) {
 	ctx = withAuthContext(ctx)
 
-	registryOSClient, err := app.registryClient.Client()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	namespace, name, err := getNamespaceName(repo.Named().Name())
-	if err != nil {
-		return nil, nil, err
-	}
-
 	r := &repository{
 		Repository: repo,
 
-		ctx:        ctx,
-		app:        app,
-		crossmount: crossmount,
-
-		imageStream: imagestream.New(ctx, namespace, name, registryOSClient),
-		cache:       cache.NewRepositoryDigest(app.cache),
-		icsp:        registryOSClient.ImageContentSourcePolicy(),
-		idms:        registryOSClient.ImageDigestMirrorSet(),
-		itms:        registryOSClient.ImageTagMirrorSet(),
-		nativeRead:  app.nativeReadRegex != nil && app.nativeReadRegex.MatchString(repo.Named().Name()),
+		ctx:                  ctx,
+		app:                  app,
+		crossmount:           crossmount,
+		cache:                cache.NewRepositoryDigest(app.cache),
+		imageStreamsDisabled: app.imageStreamsDisabled,
+		nativeRead:           app.imageStreamsDisabled || (app.nativeReadRegex != nil && app.nativeReadRegex.MatchString(repo.Named().Name())),
 	}
 
-	r.remoteBlobGetter = NewBlobGetterService(
-		r.imageStream,
-		r.imageStream.GetSecrets,
-		r.cache,
-		r.app.metrics,
-		r.icsp,
-		r.idms,
-		r.itms,
-	)
+	// In the ImageStream-less profile there is no image.openshift.io client,
+	// imageStream, or pullthrough wiring: reads and writes are native-only.
+	if !app.imageStreamsDisabled {
+		registryOSClient, err := app.registryClient.Client()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		namespace, name, err := getNamespaceName(repo.Named().Name())
+		if err != nil {
+			return nil, nil, err
+		}
+
+		r.imageStream = imagestream.New(ctx, namespace, name, registryOSClient)
+		r.icsp = registryOSClient.ImageContentSourcePolicy()
+		r.idms = registryOSClient.ImageDigestMirrorSet()
+		r.itms = registryOSClient.ImageTagMirrorSet()
+
+		r.remoteBlobGetter = NewBlobGetterService(
+			r.imageStream,
+			r.imageStream.GetSecrets,
+			r.cache,
+			r.app.metrics,
+			r.icsp,
+			r.idms,
+			r.itms,
+		)
+	}
 
 	repo = distribution.Repository(r)
 	repo = r.app.metrics.Repository(repo, repo.Named().Name())
@@ -121,36 +132,44 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 		return nil, err
 	}
 
-	registryOSClient, err := r.app.registryClient.Client()
-	if err != nil {
-		return nil, err
+	var registryOSClient client.Interface
+	if !r.imageStreamsDisabled {
+		registryOSClient, err = r.app.registryClient.Client()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ms = &manifestService{
-		manifests:        ms,
-		blobStore:        r.Blobs(ctx),
-		serverAddr:       r.app.config.Server.Addr,
-		imageStream:      r.imageStream,
-		registryOSClient: registryOSClient,
-		cache:            r.cache,
-		acceptSchema2:    r.app.config.Compatibility.AcceptSchema2,
-		nativeRead:       r.nativeRead,
-		metrics:          r.app.metrics,
+		manifests:            ms,
+		blobStore:            r.Blobs(ctx),
+		serverAddr:           r.app.config.Server.Addr,
+		imageStream:          r.imageStream,
+		registryOSClient:     registryOSClient,
+		cache:                r.cache,
+		acceptSchema2:        r.app.config.Compatibility.AcceptSchema2,
+		nativeRead:           r.nativeRead,
+		imageStreamsDisabled: r.imageStreamsDisabled,
+		metrics:              r.app.metrics,
 	}
 
-	ms = &pullthroughManifestService{
-		ManifestService: ms,
-		newLocalManifestService: func(ctx context.Context) (distribution.ManifestService, error) {
-			return r.Repository.Manifests(ctx, opts...)
-		},
-		imageStream:  r.imageStream,
-		cache:        r.cache,
-		mirror:       r.app.config.Pullthrough.Mirror,
-		registryAddr: r.app.config.Server.Addr,
-		metrics:      r.app.metrics,
-		idms:         r.idms,
-		icsp:         r.icsp,
-		itms:         r.itms,
+	// Pullthrough resolves remotes from imagestream data; it does not exist in
+	// the ImageStream-less profile.
+	if !r.imageStreamsDisabled {
+		ms = &pullthroughManifestService{
+			ManifestService: ms,
+			newLocalManifestService: func(ctx context.Context) (distribution.ManifestService, error) {
+				return r.Repository.Manifests(ctx, opts...)
+			},
+			imageStream:  r.imageStream,
+			cache:        r.cache,
+			mirror:       r.app.config.Pullthrough.Mirror,
+			registryAddr: r.app.config.Server.Addr,
+			metrics:      r.app.metrics,
+			idms:         r.idms,
+			icsp:         r.icsp,
+			itms:         r.itms,
+		}
 	}
 
 	ms = newPendingErrorsManifestService(ms, r)
@@ -176,13 +195,17 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 		}
 	}
 
-	bs = &pullthroughBlobStore{
-		BlobStore: bs,
+	// Pullthrough resolves remotes from imagestream data; skip it in the
+	// ImageStream-less profile (r.remoteBlobGetter is nil there).
+	if !r.imageStreamsDisabled {
+		bs = &pullthroughBlobStore{
+			BlobStore: bs,
 
-		remoteBlobGetter:  r.remoteBlobGetter,
-		writeLimiter:      r.app.writeLimiter,
-		mirror:            r.app.config.Pullthrough.Mirror,
-		newLocalBlobStore: r.Repository.Blobs,
+			remoteBlobGetter:  r.remoteBlobGetter,
+			writeLimiter:      r.app.writeLimiter,
+			mirror:            r.app.config.Pullthrough.Mirror,
+			newLocalBlobStore: r.Repository.Blobs,
+		}
 	}
 
 	bs = newPendingErrorsBlobStore(bs, r)
@@ -201,10 +224,11 @@ func (r *repository) Tags(ctx context.Context) distribution.TagService {
 	ts := r.Repository.Tags(ctx)
 
 	ts = &tagService{
-		TagService:  ts,
-		imageStream: r.imageStream,
-		nativeRead:  r.nativeRead,
-		metrics:     r.app.metrics,
+		TagService:           ts,
+		imageStream:          r.imageStream,
+		nativeRead:           r.nativeRead,
+		imageStreamsDisabled: r.imageStreamsDisabled,
+		metrics:              r.app.metrics,
 	}
 
 	ts = newPendingErrorsTagService(ts, r)
@@ -228,6 +252,14 @@ func (r *repository) BlobDescriptorService(svc distribution.BlobDescriptorServic
 }
 
 func (r *repository) checkPendingErrors(ctx context.Context) error {
+	// The authPerformed marker, deferred errors, and userClient are all
+	// populated by the OpenShift access controller. In the ImageStream-less
+	// profile a non-openshift auth backend (htpasswd/none) is in use and never
+	// sets them, and r.imageStream is nil, so there is nothing to check.
+	if r.imageStreamsDisabled {
+		return nil
+	}
+
 	if !authPerformed(ctx) {
 		return fmt.Errorf("openshift.auth.completed missing from context")
 	}

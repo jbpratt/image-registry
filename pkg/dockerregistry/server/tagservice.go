@@ -23,10 +23,22 @@ type tagService struct {
 	// about tags pushed while native reads were enabled, so a native
 	// listing is incomplete by construction.
 	nativeRead bool
-	metrics    metrics.Metrics
+
+	// imageStreamsDisabled is set in the ImageStream-less profile (the zero
+	// value keeps the default ImageStream-backed behavior). When set, all
+	// operations use the embedded native storage tag store only: Get/All/Lookup
+	// never consult the (nil) imagestream, Tag writes the native link as the
+	// sole record, and Untag deletes it.
+	imageStreamsDisabled bool
+
+	metrics metrics.Metrics
 }
 
 func (t tagService) Get(ctx context.Context, tag string) (distribution.Descriptor, error) {
+	if t.imageStreamsDisabled {
+		return t.TagService.Get(ctx, tag)
+	}
+
 	if !t.nativeRead {
 		return t.imageStreamGet(ctx, tag)
 	}
@@ -69,6 +81,10 @@ func (t tagService) imageStreamGet(ctx context.Context, tag string) (distributio
 }
 
 func (t tagService) All(ctx context.Context) ([]string, error) {
+	if t.imageStreamsDisabled {
+		return t.TagService.All(ctx)
+	}
+
 	ok, err := t.imageStream.Exists(ctx)
 	if err != nil {
 		return nil, err
@@ -91,6 +107,10 @@ func (t tagService) All(ctx context.Context) ([]string, error) {
 }
 
 func (t tagService) Lookup(ctx context.Context, desc distribution.Descriptor) ([]string, error) {
+	if t.imageStreamsDisabled {
+		return t.TagService.Lookup(ctx, desc)
+	}
+
 	ok, err := t.imageStream.Exists(ctx)
 	if err != nil {
 		return nil, err
@@ -121,6 +141,12 @@ func (t tagService) Lookup(ctx context.Context, desc distribution.Descriptor) ([
 // reads enabled the storage tag link is written as well so that Get can
 // resolve the tag without the apiserver.
 func (t tagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
+	if t.imageStreamsDisabled {
+		// No ImageStreamMapping backs this tag; the native link is the only
+		// record, so a write failure must fail the push.
+		return t.TagService.Tag(ctx, tag, desc)
+	}
+
 	if t.nativeRead {
 		if err := t.TagService.Tag(ctx, tag, desc); err != nil {
 			// The ImageStreamMapping from the preceding manifest Put already
@@ -135,5 +161,11 @@ func (t tagService) Tag(ctx context.Context, tag string, desc distribution.Descr
 }
 
 func (t tagService) Untag(ctx context.Context, tag string) error {
+	if t.imageStreamsDisabled {
+		// There is no etcd copy; delete the native tag link so the tag stops
+		// resolving (with imagestreams, Untag is a no-op because the
+		// ImageStream is authoritative and updated out of band).
+		return t.TagService.Untag(ctx, tag)
+	}
 	return nil
 }

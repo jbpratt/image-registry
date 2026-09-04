@@ -62,6 +62,14 @@ func (bs *blobDescriptorService) Stat(ctx context.Context, dgst digest.Digest) (
 		return desc, nil
 	}
 
+	// In the ImageStream-less profile the repository layer link checked above
+	// is the sole proof of membership; there is no imagestream to consult, so
+	// a blob without a repo link is unknown to this repository.
+	if bs.repo.imageStreamsDisabled {
+		dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: blob %s not linked in repository %s (imagestream-less)", dgst.String(), bs.repo.Named().Name())
+		return distribution.Descriptor{}, distribution.ErrBlobUnknown
+	}
+
 	// ensure it's referenced inside of corresponding image stream
 	if bs.repo.cache.ContainsRepository(dgst, bs.repo.imageStream.Reference()) {
 		dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: found cached blob %q in repository %s", dgst.String(), bs.repo.imageStream.Reference())

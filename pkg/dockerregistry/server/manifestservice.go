@@ -42,12 +42,24 @@ type manifestService struct {
 	// -d, istag delete) and until pruning removes the link; the imagestream
 	// path would return 404 in that window. See NATIVE-READ-POC.md.
 	nativeRead bool
-	metrics    metrics.Metrics
+
+	// imageStreamsDisabled is set in the ImageStream-less profile (the zero
+	// value keeps the default ImageStream-backed behavior). When set, Put
+	// writes only the native manifest revision (no Image/ImageStreamMapping),
+	// and Exists/Get/Delete are served from native storage with no imagestream
+	// fallback (imageStream is nil).
+	imageStreamsDisabled bool
+
+	metrics metrics.Metrics
 }
 
 // Exists returns true if the manifest specified by dgst exists.
 func (m *manifestService) Exists(ctx context.Context, dgst digest.Digest) (bool, error) {
 	dcontext.GetLogger(ctx).Debugf("(*manifestService).Exists")
+
+	if m.imageStreamsDisabled {
+		return m.manifests.Exists(ctx, dgst)
+	}
 
 	image, err := m.imageStream.GetImageOfImageStream(ctx, dgst)
 	if err != nil {
@@ -76,6 +88,13 @@ func (m *manifestService) Get(ctx context.Context, dgst digest.Digest, options .
 		m.metrics.RecordNativeReadResolution(resolutionNative, opManifestGet)
 		return manifest, nil
 	}
+
+	// ImageStream-less profile: native storage is authoritative, so a miss is
+	// a miss — never fall back to the (nil) imagestream.
+	if m.imageStreamsDisabled {
+		return nil, err
+	}
+
 	resolution := nativeMissResolution(ctx, opManifestGet, err)
 
 	manifest, err = m.imageStreamGet(ctx, dgst, options...)
@@ -158,6 +177,13 @@ func (m *manifestService) Put(ctx context.Context, manifest distribution.Manifes
 	_, err = m.manifests.Put(ctx, manifest, options...)
 	if err != nil {
 		return "", err
+	}
+
+	// ImageStream-less profile: the native manifest revision written above is
+	// the whole write. Skip Image/ImageStreamMapping creation (and the user
+	// client it needs). The tag link, if any, is written by tagService.Tag.
+	if m.imageStreamsDisabled {
+		return mh.Digest()
 	}
 
 	config, err := mh.Config(ctx)
@@ -247,6 +273,12 @@ func (m *manifestService) Put(ctx context.Context, manifest distribution.Manifes
 // the content related to the manifest in the registry's storage (signatures).
 func (m *manifestService) Delete(ctx context.Context, dgst digest.Digest) error {
 	dcontext.GetLogger(ctx).Debugf("(*manifestService).Delete")
+
+	// ImageStream-less profile: there is no imagestream reference to guard
+	// against, so delete the native manifest link directly.
+	if m.imageStreamsDisabled {
+		return m.manifests.Delete(ctx, dgst)
+	}
 
 	_, err := m.imageStream.GetImageOfImageStream(ctx, dgst)
 	if err == nil {

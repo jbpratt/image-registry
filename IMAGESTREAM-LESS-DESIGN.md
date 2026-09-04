@@ -7,6 +7,39 @@ question: what does it take to run the registry when the ImageStream API is not
 there at all — the MicroShift/edge shape. It is a brainstorm of options with a
 recommended minimal POC, not a productization plan. No code is changed here.
 
+## Decisions (2026-09-04)
+
+Human decisions on the §2/§4 options. Sections below are the detail; this is the
+record.
+
+1. **Auth — PROVISIONAL.** The POC uses **option D** (distribution-native
+   `htpasswd`) to prove the data path; the productization target is **option C**
+   (virtual resource `registry.openshift.io/repositories` + shipped ClusterRoles,
+   kube SAR). The choice is explicitly unsettled, so the POC must **not hard-wire
+   either** — the auth seam stays pluggable. *The seam in code terms:* the
+   `AccessController` is selected by distribution's `auth:` config block (a map
+   with exactly one key), resolved through the `registry/auth` registry. The
+   OpenShift SAR controller is registered under `auth.Register("openshift", …)`
+   (`supermiddleware/app.go:105`) and taken when `Auth.Type() == "openshift"`
+   (`app.go:163`). Setting `auth: { htpasswd: … }` instead selects distribution's
+   bundled htpasswd controller (`vendor/.../registry/auth/htpasswd`) — a different
+   registered `AccessController`, no OpenShift auth code path, no rebuild. Target C
+   is a new/extended registered controller issuing SARs against
+   `registry.openshift.io/repositories`. The `openshift.imagestreams.enabled` mode
+   flag does **not** pick the auth backend — the `auth:` key does; that
+   independence is exactly what keeps the seam pluggable.
+2. **Tag storage — option A** (native `_manifests/tags`). Loss of `oc`
+   ImageStream tooling in this mode is accepted (§2a).
+3. **Pullthrough — option C (none) first**, may move to B later. Concrete list of
+   what C gives up in §2c.
+4. **Mode — explicit config flag, never auto-detected.** Fail-fast at startup if
+   the image API is unreachable and the flag is unset (§2f).
+5. **Framing — "Edge / ImageStream-less profile"**, MicroShift-*compatible*, not
+   MicroShift-only (§2e).
+6. **Signatures — via OCI 1.1 referrers** per `REFERRERS-PLAN.md`, not the Image
+   CR; Image-CR config metadata is dropped (§2d). Referrers are **not** in the
+   minimal POC critical path — sequenced after push/pull round-trips.
+
 ## 1. Scope and assumptions
 
 - **Opt-in, experimental.** A cluster explicitly selects this mode; the default
@@ -85,17 +118,26 @@ signature put → `imagesignatures create`. All are SARs; none read istag data.
 | **C. New virtual resource `registry.openshift.io/repositories`** | swap group+resource; ship ClusterRoles binding it to the registry's service-relevant subjects | Needs roles shipped | Needs roles shipped (operator/manifests) | Clean, image-specific, decoupled from `image.openshift.io`; cost: define + ship RBAC, teach admins the new verb |
 | **D. Distribution-native token / htpasswd / none** | select a non-`openshift` auth backend (`vendor/.../registry/auth/{token,htpasswd,silly}`) | n/a (bypasses kube authz) | Yes | Right answer for disconnected edge with no kube RBAC story; but drops per-namespace kube identity/SAR entirely — a policy decision, not a drop-in |
 
-**Recommended: C as the target, A for the first POC.** For a POC on a cluster
-where the operator still ships the imagestream ClusterRoles, **A requires no
-auth change** — the SAR against `imagestreams/layers` keeps working even with
-the API disabled. For the *absent*/MicroShift shape, either **C** (a registry
--owned virtual resource with shipped RBAC, keeps kube identity + SAR) or **D**
-(`htpasswd`/`token` for a truly kube-authz-less edge). The concrete auth.go
-change for C is small and localized: `verifyImageStreamAccess` /
+**Decided (PROVISIONAL): D for the POC, C as the productization target; the seam
+stays pluggable.** The POC uses distribution-native **`htpasswd`** to prove the
+data path end-to-end without any kube-authz dependency: select it with an
+`auth: { htpasswd: … }` block, which makes distribution instantiate its bundled
+`vendor/.../registry/auth/htpasswd` controller instead of the OpenShift SAR
+controller (registered under `auth.Register("openshift", …)`,
+`supermiddleware/app.go:105`; taken only when `Auth.Type()=="openshift"`,
+`app.go:163`). Because the backend is chosen by the `auth:` config key — not by
+the `openshift.imagestreams.enabled` mode flag — **neither auth model is
+hard-wired**: the same binary runs htpasswd (POC), the OpenShift SAR controller
+(default OCP), or a future C controller by config alone. The productization
+target **C** is a new/extended registered `AccessController` that issues SARs
+against `registry.openshift.io/repositories` (keeps kube identity + per-namespace
+SAR without `image.openshift.io`); its `verifyImageStreamAccess` /
 `verifyCatalogAccess` / `verifyPruneAccess` / `verifyImageSignatureAccess`
-(`auth.go:523-555`) each name a resource string in one place; point them at the
-new group/resource behind the mode flag. The token endpoint wiring
-(`app.go:163`, gated on `Auth.Type()=="openshift"`) is unaffected by A/C.
+(`auth.go:523-555`) equivalents name the new group/resource string in one place.
+The human is explicitly unsure between C and D; the seam above is what lets that
+decision stay open. **A** (keep SAR on `imagestreams/layers`, relying on
+surviving RBAC roles) remains viable only in the *disabled* case and is not the
+POC choice.
 
 ### 2c. Pullthrough
 
@@ -112,7 +154,7 @@ Today pullthrough resolves the remote from istag data: `remoteGet` →
 | **B. Explicit config repo→remote mapping** ✅ | new `openshift.pullthrough.mappings` (repo-prefix → remote URL + optional secret ref) consulted where `IdentifyCandidateRepositories` is today | Keeps per-repo pullthrough without istags; admin-declared instead of istag-derived; cost: a resolver + config schema, creds from a k8s Secret ref instead of `imagestreams/secrets` |
 | C. Disable pullthrough entirely | `pullthrough.enabled=false` in this mode | Simplest; matches MicroShift (host CRI-O mirrors handle remote pulls, §2e); registry serves only locally-pushed content |
 
-**Recommended: C for the POC, B as the follow-on.** MicroShift pushes remote
+**Decided: C for the POC, B as the follow-on.** MicroShift pushes remote
 mirroring down to CRI-O `registries.conf.d` (§2e), so a registry in this mode
 does not need pullthrough at all — disable it and let the node runtime mirror.
 If in-registry pullthrough is later required, B (explicit config mapping) is the
@@ -121,22 +163,49 @@ appliance. Note `Pullthrough.Enabled` is currently *forced true*
 (`configuration.go:445`), so "disable" needs that migration relaxed under the
 mode flag.
 
+#### What choosing C gives up
+
+Every in-registry pullthrough behavior below reads istag data and disappears with
+it. Each row: the code it lives in, what breaks for the user, and the CRI-O /
+node-mirror alternative (or "none" if there is no node-runtime equivalent).
+
+| # | Feature (code anchor) | What breaks | CRI-O / node-mirror alternative |
+|---|---|---|---|
+| 1 | Manifest pullthrough (`pullthroughmanifestservice.go:54` `remoteGet` → `GetImageOfImageStream`) | Pulling an **imported** image (istag present, manifest never pushed locally) — the manifest is only reachable via the istag's `DockerImageReference` | Node pulls the source ref directly via `registries.conf.d` mirror; no registry indirection |
+| 2 | Blob pullthrough `Stat`/`ServeBlob` (`pullthroughblobstore.go:33,57`) | Serving layers of imported images not in local storage | Same — node pulls layers from upstream/mirror directly |
+| 3 | Mirror-on-pull (`pullthroughblobstore.go:74,184` `storeLocalInBackground`; `pullthroughmanifestservice.go:107` `mirrorManifest`) | First pull no longer warms local storage from the remote | None in-registry; CRI-O keeps its own node image cache |
+| 4 | Candidate-remote resolution (`identifycandidaterepositories.go:52`, from `Status.Tags[].Items[].DockerImageReference`) | Multi-source / failover remote resolution per istag (primary + secondary tag events) | `ImageDigestMirrorSet` / `registries.conf.d` mirror lists give per-node failover |
+| 5 | Pullthrough pull secrets (`imagestream.go:296` `GetSecrets`, used `pullthroughmanifestservice.go:130`) | Authenticated pullthrough from private upstreams via the namespace's `imagestreams/secrets` | Node-level pull secrets in `/etc/containers` / kubelet pull secrets |
+| 6 | Per-tag insecure transport (`identifycandidaterepositories.go:92-101`; `TagIsInsecure` at `pullthroughmanifestservice.go:150`) | `importPolicy.insecure` / `insecureRepository` annotation selecting insecure remote transport per istag | `insecure = true` on the mirror in `registries.conf` |
+| 7 | Registry-side ICSP/IDMS/ITMS rewrite (`getImportContext` icsp/idms/itms at `pullthroughmanifestservice.go:135`) | The registry applying cluster mirror sets while resolving a remote pull | **Native to CRI-O** — the node already consumes IDMS/ICSP (or their transformed form on MicroShift); cleanest handoff |
+| 8 | `reference-policy=local` istags (`oc tag --reference-policy=local`, `oc import-image`) | The whole local-reference-policy workflow: the istag's `DockerImageReference` is rewritten to the internal registry so every pull flows through it and pullthroughs to source | Pull the source ref directly with node mirror config; no "local" indirection exists |
+| 9 | Cross-namespace istag refs / remote blob mounting (cross-mount auth `auth.go:346`; cross-repo blob descriptor) | Sharing an image across namespaces via istags, and cross-repo blob mount that resolves through pullthrough | **None** — a cross-namespace istag is an ImageStream construct with no node-runtime equivalent; images must be pushed/pulled by explicit ref |
+| 10 | Builds pulling from istags (S2I/docker build `from`/`to` `ImageStreamTag`) | Build inputs/outputs that reference istags and rely on istag→registry resolution + pullthrough for imported base images | Reference images by registry ref directly; no istag inputs/outputs |
+
+Rows 8–10 are workflow-level and partly originate outside this repo (import is
+openshift-apiserver), but their **serving** side depends on the in-registry
+pullthrough above, so they break with C.
+
 ### 2d. Image policy / triggers / pruning
 
 | Capability | Where it lives today | In ImageStream-less mode | Upstream substitute |
 |---|---|---|---|
 | Build/deployment triggers on istag change | openshift-apiserver + controllers (not in this repo) | **Gone** — no istag to watch | None (by design; not the registry's job) |
 | `image.openshift.io/ImagePolicy` admission | kube-apiserver admission plugin | **Gone** | None; MicroShift already disables this plugin (§2e) |
-| Image signatures | `signaturedispatcher.go` via `imagesignatures`/`imagestreamimages` | **Gone** — no CR to store/read signatures | Sigstore/cosign at the client/CRI-O layer (out of registry scope) |
+| Image signatures | `signaturedispatcher.go` via `imagesignatures`/`imagestreamimages` | **Gone** — no CR to store/read signatures | **OCI 1.1 referrers** per `REFERRERS-PLAN.md` (signatures stored/served as referrer artifacts in native storage, not the Image CR); sigstore/cosign at the client/CRI-O layer remains the verification path |
 | Pruning (`oc adm prune images`, `dockerregistry prune`) | `pkg/dockerregistry/server/prune/` lists Image + ImageStream CRs | **Gone** — nothing to enumerate CRs | **`registry garbage-collect`** (distribution native GC over `_manifests`/`_layers`) once the native manifest+tag store is authoritative |
 | Quota (per-project image quota) | `imagestreammappings` create is quota-checked (`imagestream.go`) | **Gone** — no ISM create path | None in-registry; rely on storage quota |
 
-Net: everything CR-mediated disappears. The one capability with a real upstream
-substitute is **pruning → distribution storage GC** (`registry
-garbage-collect`), which becomes usable precisely because tag storage moves
-native (2a-A): GC marks reachable manifests from tags and sweeps the rest.
-Triggers, image policy, signatures, and quota have no in-registry substitute —
-their absence is inherent to the mode, not a gap to close here.
+Net: everything CR-mediated disappears. Two capabilities have a real in-registry
+substitute: **pruning → distribution storage GC** (`registry garbage-collect`),
+usable precisely because tag storage moves native (2a-A) so GC marks reachable
+manifests from tags and sweeps the rest; and **signatures → OCI 1.1 referrers**
+(`REFERRERS-PLAN.md`) stored/served natively instead of via the `images` CR.
+Referrers are **sequenced after** the push/pull round-trip — they are not on the
+minimal POC critical path (§3). Image-CR-sourced config metadata is dropped
+(storage is the only source of truth, §1). Triggers, image policy, and quota
+have no in-registry substitute — their absence is inherent to the mode, not a gap
+to close here.
 
 ### 2e. What MicroShift already does (and whether this is "the MicroShift profile")
 
@@ -219,19 +288,24 @@ larger productization cost and is flagged, not designed, here.
 ## 3. Recommended minimal POC
 
 Goal: `podman push` then `podman pull` succeed against the registry with the
-ImageStream API disabled, on a cluster whose imagestream RBAC ClusterRoles still
-exist (so auth needs no change — §2b-A). Smallest diff:
+ImageStream API disabled, using distribution-native **`htpasswd`** auth (§2b-D)
+so the POC proves the native data path with no kube-authz dependency. Smallest
+diff:
 
 | # | File | Change |
 |---|---|---|
 | 1 | `configuration/configuration.go` | add `ImageStreams{Enabled bool}` block (default true); relax `Pullthrough` forced-true under the flag |
-| 2 | `pkg/dockerregistry/server/app.go` | parse the flag into an `App` field (mirror `NativeReadPath` wiring) |
+| 2 | `pkg/dockerregistry/server/app.go` | parse the flag into an `App` field (mirror `NativeReadPath` wiring); the OpenShift token endpoint stays gated on `Auth.Type()=="openshift"` (`app.go:163`), so it is inert under htpasswd |
 | 3 | `pkg/dockerregistry/server/repository.go` | when disabled: set `nativeRead=true` with no fallback; skip pullthrough wrapping; pass flag into manifest/tag services |
 | 4 | `pkg/dockerregistry/server/manifestservice.go` | `Put`: skip ImageStreamMapping/Image CREATE when disabled (write native manifest revision only, which distribution already does) |
 | 5 | `pkg/dockerregistry/server/tagservice.go` | `Get`/`All` native-only when disabled; make `Untag` delete the native tag link |
 
-No auth.go change in the minimal POC (relies on surviving RBAC). No new API, no
-controller, no operator change (set the config by hand for the POC).
+**Auth for the POC is selected by config, not code:** an `auth: { htpasswd: … }`
+block picks distribution's bundled htpasswd `AccessController` over the OpenShift
+SAR controller (`Auth.Type()` in `app.go:163`; registration at
+`supermiddleware/app.go:105`), so **no `auth.go` change** is needed and the SAR
+path is simply not selected. No new API, no controller, no operator change (set
+the config by hand for the POC). Productization auth (§2b-C) is out of the POC.
 
 **Estimate: 5–8 focused days** (2–3 to wire the flag + write path, 2–3 to test
 push/pull/list/delete on CRC with the image API disabled, 1–2 slack).
@@ -248,41 +322,31 @@ push/pull/list/delete on CRC with the image API disabled, 1–2 slack).
 4. `registry garbage-collect` cannot reclaim space because the native
    manifest/tag store is not authoritative enough to compute reachability.
 
-## 4. Open questions for the human
+## 4. Decisions taken and productization follow-ons
 
-1. **Auth model for the *absent* case (§2b).** Options: (A) keep SAR on
-   `imagestreams/layers` — only works if RBAC roles are shipped independently;
-   (C) new virtual resource `registry.openshift.io/repositories` + shipped
-   ClusterRoles, keeping kube identity + SAR; (D) distribution-native
-   `token`/`htpasswd` for kube-authz-less edge. **Recommendation: C** as the
-   productization target (image-specific, keeps per-namespace kube RBAC), **D**
-   only for a genuinely disconnected appliance. Confirm we want to keep kube SAR
-   authorization at all in this mode.
+The §2/§4 questions are resolved — see **Decisions (2026-09-04)** at the top.
+Summary and the work that remains open after the decisions:
 
-2. **Tag storage backing (§2a).** (A) native `_manifests/tags`; (B) a registry
-   -owned CRD; (C) none/v2-only. **Recommendation: A.** Accept losing all
-   `oc`-ImageStream tooling (`oc tag`, imports, triggers, `oc get istag`)? Or is
-   a kube-visible per-repo object (B) a hard requirement for RBAC/quota later?
+1. **Auth (§2b) — decided PROVISIONAL: D for POC, C as target, seam pluggable.**
+   *Open:* pick C vs D for productization (human explicitly unsure); if C, define
+   and ship the `registry.openshift.io/repositories` ClusterRoles and the new
+   `AccessController`. The POC does not settle this.
+2. **Tag storage (§2a) — decided: A** (native `_manifests/tags`), accepting the
+   loss of `oc`-ImageStream tooling. No open item.
+3. **Pullthrough (§2c) — decided: C for POC, B later.** *Open:* if in-registry
+   per-repo pullthrough is later required, design the B config schema + resolver.
+   The concrete C loss list is in §2c.
+4. **Mode switch (§2f) — decided: explicit config flag, never auto-detected;
+   fail-fast when unset on a cluster without the API.** No open item.
+5. **Framing (§2e) — decided: "edge / ImageStream-less profile",
+   MicroShift-*compatible*, not MicroShift-only.** No open item.
+6. **Signatures + image config metadata (§2d) — decided: OCI 1.1 referrers per
+   `REFERRERS-PLAN.md` (not the Image CR); Image-CR config metadata dropped;
+   referrers sequenced after push/pull, off the POC critical path.** *Open:* the
+   referrers store/serve design lives in `REFERRERS-PLAN.md`; keep the two docs
+   consistent.
 
-3. **Pullthrough (§2c).** (A) whole-registry single-remote proxy; (B) explicit
-   config repo→remote mapping; (C) none. **Recommendation: C** for edge (CRI-O
-   mirrors handle it), **B** if in-registry per-repo pullthrough is required.
-   Is any pullthrough needed in this mode, or is node-level mirroring the answer?
-
-4. **Absent vs disabled, and auto-detection (§2f).** Recommendation: make the
-   mode an **explicit config flag**, never auto-detected (an apiserver blip must
-   not look like "absent"). Confirm we accept fail-fast behavior if the flag is
-   unset on a cluster without the API, rather than a silent degrade.
-
-5. **Is this "the MicroShift profile" (§2e)?** Recommendation: build it as the
-   **edge / ImageStream-less profile** (MicroShift-*compatible*), documented as
-   such, not literally MicroShift-only — MicroShift ships no registry today, so
-   this is what it would take to run one there, and it may also serve OCP
-   clusters disabling the image API for etcd-load reasons. Agree on the framing
-   and name before the operator work starts.
-
-6. **Signatures + image config metadata (§2d).** With no `images` CR, signature
-   storage/serving and Image-CR-sourced config metadata disappear. Recommendation:
-   drop both in this mode and defer signing to sigstore/cosign at the CRI-O/client
-   layer. Confirm no consumer in the target environment needs registry-served
-   signatures or the Image CR config blob.
+**Productization cost carried by cluster-image-registry-operator** (out of this
+repo, unchanged from §2f): expose the config knob, stop depending on ImageStream
+RBAC + the image API being present, ship the §2b-C ClusterRoles if C is chosen,
+and not gate the registry Deployment on `image.openshift.io` discovery.

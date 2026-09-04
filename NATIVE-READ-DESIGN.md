@@ -183,6 +183,28 @@ Folding in the ir-8y7 read-only assessment of the POC branch:
   resolved by keeping that line and taking the POC's native wiring. No semantic
   conflict. `configuration.go` and `tagservice_test.go` auto-merged.
 
+### Workstream 4 status (projection stub)
+
+The level-triggered projection controller stub landed cluster-free in
+`pkg/projection` plus `cmd/native-read-projector` (~480 lines non-test). What the
+fakes (fake `TagLister` + versioned image clientset) **measured**: reconcile is
+idempotent — a repeated identical push produces no second status write; a native
+tag whose head already matches is left byte-for-byte, so no-op detection is exact.
+Chaos with 30% of events dropped before enqueue converges every tag across 10
+repos after one resync, because reconcile re-lists the tag store rather than
+applying event payloads. Out-of-order delivery converges to the `TagLister` truth,
+not event order. A restarted controller with an empty queue converges from the
+tag store alone via the injectable resync list. Event-to-write lag p99 over the
+chaos load was **~16ms** with fakes (bound asserted < 2s). The stub only
+adds/updates status tags and never removes, honoring facts 3/6; spec is untouched.
+
+What still **needs a cluster**: real push→CR lag under load (the H4 number that
+matters), the native tag-store adapter behind `TagLister` (a documented TODO in
+the binary), registry-side notification config to actually emit the webhooks, and
+the two-masters interaction (`oc tag` writes racing the projection, fact 6).
+Deliberately skipped per the bead: tag deletion/tombstones, Image CRs, an
+operator/deployment manifest.
+
 ## Open questions / next steps
 
 - **Workstream 2 (correctness harness, cluster).** Extend `test/integration/`:

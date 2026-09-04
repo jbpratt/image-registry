@@ -75,6 +75,12 @@ type App struct {
 	// tag and manifest reads from native storage before the imagestream.
 	// nil means native reads are disabled.
 	nativeReadRegex *regexp.Regexp
+
+	// imageStreamsDisabled selects the edge / ImageStream-less profile (the
+	// zero value keeps the default image.openshift.io-backed behavior). When
+	// set, no OpenShift image client is constructed and reads/writes use
+	// distribution's native storage only.
+	imageStreamsDisabled bool
 }
 
 func (app *App) Storage(driver storagedriver.StorageDriver, options map[string]interface{}) (storagedriver.StorageDriver, error) {
@@ -119,6 +125,11 @@ func NewApp(ctx context.Context, registryClient client.RegistryClient, dockerCon
 		app.metrics = metrics.NewMetrics(metrics.NewPrometheusSink())
 	} else {
 		app.metrics = metrics.NewNoopMetrics()
+	}
+
+	app.imageStreamsDisabled = app.config.ImageStreams != nil && !app.config.ImageStreams.Enabled
+	if app.imageStreamsDisabled {
+		dcontext.GetLogger(ctx).Infof("ImageStream integration disabled (edge / ImageStream-less profile): native storage only, no image.openshift.io client")
 	}
 
 	if app.config.NativeReadPath != nil && app.config.NativeReadPath.Enabled {
@@ -175,18 +186,28 @@ func NewApp(ctx context.Context, registryClient client.RegistryClient, dockerCon
 	app.registerBlobHandler(dockerApp)
 
 	// Registry extensions endpoint provides extra functionality to handle the image
-	// signatures.
-	isImageClient, err := registryClient.Client()
-	if err != nil {
-		dcontext.GetLogger(dockerApp).Fatalf("unable to get client for signatures: %v", err)
+	// signatures. Signatures are backed by the image.openshift.io API, so the
+	// handler (and the client it needs) is skipped in the ImageStream-less
+	// profile; that mode serves signatures via OCI 1.1 referrers instead (see
+	// IMAGESTREAM-LESS-DESIGN.md §2d).
+	if !app.imageStreamsDisabled {
+		isImageClient, err := registryClient.Client()
+		if err != nil {
+			dcontext.GetLogger(dockerApp).Fatalf("unable to get client for signatures: %v", err)
+		}
+		RegisterSignatureHandler(dockerApp, isImageClient)
 	}
-	RegisterSignatureHandler(dockerApp, isImageClient)
 
-	// Advertise features supported by OpenShift
-	if dockerApp.Config.HTTP.Headers == nil {
-		dockerApp.Config.HTTP.Headers = http.Header{}
+	// Advertise features supported by OpenShift. The signature extension is not
+	// served in the ImageStream-less profile, so do not advertise it there —
+	// otherwise clients (podman/skopeo) probe the missing endpoint and fail the
+	// pull.
+	if !app.imageStreamsDisabled {
+		if dockerApp.Config.HTTP.Headers == nil {
+			dockerApp.Config.HTTP.Headers = http.Header{}
+		}
+		dockerApp.Config.HTTP.Headers.Set("X-Registry-Supports-Signatures", "1")
 	}
-	dockerApp.Config.HTTP.Headers.Set("X-Registry-Supports-Signatures", "1")
 
 	dockerApp.RegisterHealthChecks()
 

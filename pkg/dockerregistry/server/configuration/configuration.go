@@ -124,6 +124,7 @@ type Configuration struct {
 	Pullthrough    *Pullthrough          `yaml:"pullthrough"`
 	Compatibility  *Compatibility        `yaml:"compatibility"`
 	NativeReadPath *NativeReadPath       `yaml:"nativereadpath"`
+	ImageStreams   *ImageStreams         `yaml:"imagestreams"`
 }
 
 type Metrics struct {
@@ -177,6 +178,18 @@ type Compatibility struct {
 type NativeReadPath struct {
 	Enabled   bool   `yaml:"enabled"`
 	RepoRegex string `yaml:"reporegex"`
+}
+
+// ImageStreams gates the registry's use of the image.openshift.io API. When
+// Enabled (the default), the registry backs tags/manifests/signatures with
+// ImageStreams as it always has. When disabled, the registry runs in the
+// edge / ImageStream-less profile: reads and writes go to distribution's
+// native storage only and no image.openshift.io client is constructed. The
+// auth backend is orthogonal to this flag — it is selected by distribution's
+// `auth:` config key (openshift SAR vs. htpasswd/none), so the seam stays
+// pluggable regardless of this setting.
+type ImageStreams struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type versionInfo struct {
@@ -442,11 +455,39 @@ func migratePullthroughSection(cfg *Configuration, options configuration.Paramet
 		err = fmt.Errorf("configuration error in openshift.pullthrough.mirror: %v", err)
 	}
 
-	if !cfg.Pullthrough.Enabled {
+	// Pullthrough resolves remotes from ImageStream tag data, so it cannot
+	// run in the ImageStream-less profile. Keep the historical "can't be
+	// disabled" clamp only while ImageStreams are enabled; otherwise honor an
+	// explicit disable (§2c-C of IMAGESTREAM-LESS-DESIGN.md).
+	if !cfg.Pullthrough.Enabled && imageStreamsEnabled(cfg) {
 		log.Warnf("pullthrough can't be disabled anymore")
 		cfg.Pullthrough.Enabled = true
 	}
 
+	return
+}
+
+// imageStreamsEnabled reports whether the registry backs itself with the
+// image.openshift.io API. Absent config means enabled (the default OCP
+// profile).
+func imageStreamsEnabled(cfg *Configuration) bool {
+	return cfg.ImageStreams == nil || cfg.ImageStreams.Enabled
+}
+
+func migrateImageStreamsSection(cfg *Configuration, options configuration.Parameters) (err error) {
+	defEnabled := true
+
+	if cfg.ImageStreams != nil {
+		options = configuration.Parameters{}
+		defEnabled = cfg.ImageStreams.Enabled
+	} else {
+		cfg.ImageStreams = &ImageStreams{}
+	}
+
+	cfg.ImageStreams.Enabled, err = getBoolOption("", "imagestreams", defEnabled, options)
+	if err != nil {
+		err = fmt.Errorf("configuration error in openshift.imagestreams.enabled: %v", err)
+	}
 	return
 }
 
@@ -529,6 +570,7 @@ func migrateMiddleware(dockercfg *configuration.Configuration, cfg *Configuratio
 		migrateServerSection,
 		migrateCacheSection,
 		migrateQuotaSection,
+		migrateImageStreamsSection,
 		migratePullthroughSection,
 		migrateCompatibilitySection,
 	} {

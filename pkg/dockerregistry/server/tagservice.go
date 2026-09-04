@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/distribution/distribution/v3"
+	dcontext "github.com/distribution/distribution/v3/context"
 	"github.com/distribution/distribution/v3/registry/api/v2"
 
 	"github.com/openshift/image-registry/pkg/dockerregistry/server/metrics"
@@ -121,7 +122,14 @@ func (t tagService) Lookup(ctx context.Context, desc distribution.Descriptor) ([
 // resolve the tag without the apiserver.
 func (t tagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
 	if t.nativeRead {
-		return t.TagService.Tag(ctx, tag, desc)
+		if err := t.TagService.Tag(ctx, tag, desc); err != nil {
+			// The ImageStreamMapping from the preceding manifest Put already
+			// recorded the tag and is authoritative; a failed native link
+			// write must not fail the push (reads fall back to the
+			// imagestream). Record it as a storage error, not migration debt.
+			dcontext.GetLogger(ctx).Warnf("native read tag write: storage error writing tag link for %q, imagestream remains authoritative: %v", tag, err)
+			t.metrics.RecordNativeReadResolution(resolutionNativeError, opTagGet)
+		}
 	}
 	return nil
 }

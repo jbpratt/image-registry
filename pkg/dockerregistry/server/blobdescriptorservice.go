@@ -58,12 +58,14 @@ func (bs *blobDescriptorService) Stat(ctx context.Context, dgst digest.Digest) (
 	// Empty layers are considered to be "public" and we don't need to check whether they are referenced - schema v2
 	// has no empty layers.
 	if isEmptyDigest(dgst) {
+		bs.repo.app.metrics.RecordNativeReadResolution(resolutionFallback, opBlobStat)
 		return desc, nil
 	}
 
 	// ensure it's referenced inside of corresponding image stream
 	if bs.repo.cache.ContainsRepository(dgst, bs.repo.imageStream.Reference()) {
 		dcontext.GetLogger(ctx).Debugf("(*blobDescriptorService).Stat: found cached blob %q in repository %s", dgst.String(), bs.repo.imageStream.Reference())
+		bs.repo.app.metrics.RecordNativeReadResolution(resolutionFallback, opBlobStat)
 		return desc, nil
 	}
 

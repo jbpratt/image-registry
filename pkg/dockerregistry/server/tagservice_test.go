@@ -343,6 +343,10 @@ func (f failingTagService) Get(ctx context.Context, tag string) (distribution.De
 	return distribution.Descriptor{}, f.err
 }
 
+func (f failingTagService) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
+	return f.err
+}
+
 func TestTagGetNativeRead(t *testing.T) {
 	ctx := testutil.WithTestLogger(context.Background(), t)
 	namespace, repo, tag := "user", "app", "latest"
@@ -410,6 +414,28 @@ func TestTagGetNativeRead(t *testing.T) {
 				t.Errorf("unexpected metrics: %v", diff)
 			}
 		})
+	}
+}
+
+func TestTagNativeReadTagErrorKeepsPushAtomic(t *testing.T) {
+	ctx := testutil.WithTestLogger(context.Background(), t)
+	c, sink := metricstesting.NewCounterSink()
+
+	ts := tagService{
+		TagService: failingTagService{err: errors.New("s3: timeout")},
+		nativeRead: true,
+		metrics:    metrics.NewMetrics(sink),
+	}
+
+	// A failed native tag link write must not fail the push: the
+	// ImageStreamMapping already recorded the tag and is authoritative.
+	if err := ts.Tag(ctx, "latest", distribution.Descriptor{Digest: "sha256:abc"}); err != nil {
+		t.Fatalf("Tag returned error, want nil: %v", err)
+	}
+
+	want := counter.M{"native_read_resolutions:native_error:tag_get": 1}
+	if diff := c.Diff(want); diff != nil {
+		t.Errorf("unexpected metrics: %v", diff)
 	}
 }
 

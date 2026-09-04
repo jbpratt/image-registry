@@ -28,6 +28,7 @@ readonly OS_CROSS_COMPILE_TARGETS=(
   cmd/dockerregistry
   cmd/distribution
   cmd/dockerregistry-tests-ext
+  cmd/native-read-projector
 )
 readonly OS_CROSS_COMPILE_BINARIES=("${OS_CROSS_COMPILE_TARGETS[@]##*/}")
 

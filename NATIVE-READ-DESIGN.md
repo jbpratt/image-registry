@@ -205,6 +205,56 @@ the two-masters interaction (`oc tag` writes racing the projection, fact 6).
 Deliberately skipped per the bead: tag deletion/tombstones, Image CRs, an
 operator/deployment manifest.
 
+## Workstream 2 results (CRC, 2026-09-04)
+
+Harness: `test/integration/nativeread/` (new package), run against CRC
+(OpenShift 4.20.1, `KUBECONFIG=$HOME/.crc/machines/crc/kubeconfig`). The
+existing suite was green on CRC before any change (`TestDeleteManifest` PASS,
+3.16s). Each test builds two in-process registries over one shared filesystem
+storage root — one with native reads on (`reporegex=.*`), one off — plus the
+same cluster, so the *same* image is read both ways. Two registries are
+required because the framework's default inmemory driver is per-instance, so
+the native-off registry could not serve blobs pushed to the native-on one; the
+native knob and the filesystem driver are both passed via
+`testframework.RegistryOption`s implemented in the test package, so
+`pkg/testframework` itself is unchanged.
+
+Full run: `go test ./test/integration/nativeread/... -run . -count=1 -v` →
+`ok ... 25.508s`, all PASS. Namespaces use the `nrpoc-` prefix and are deleted
+by `master.Close()`.
+
+Expected-failure handling: the crossmount and imagestream-side-skew cases are
+**recorded with `t.Logf` and never fail the suite** (chosen over `t.Skip` and
+env gating so the run output is the finding record). The content-equality,
+no-ghost, and metric cases are hard assertions.
+
+| Test | Mode | Expected | Observed | Finding |
+|---|---|---|---|---|
+| 1. push + read (schema2 & OCI), by tag & by digest | native vs imagestream | identical digest & bytes | identical (731 B schema2 / 693 B OCI; 3 blob refs stat+get equal) | H3 holds: zero content diffs |
+| 1. tag overwrite then immediate GET | native | new digest | native returned the new digest immediately | dual-write on `Tag` works on overwrite |
+| 2. cross-repo blob mount into native repo | native | expected first failure (finding) | `201 Created`; blob then servable from dst natively | mount is a blob-link/auth op, unaffected by the native read flag; no divergence observed |
+| 3. delete manifest via registry API, GET by digest | native & imagestream | no ghost | both `manifest unknown` after delete | native serves no ghost once the storage revision link is removed |
+| 4a. `oc tag -d` (istag delete), storage link intact | native vs imagestream | skew (native still serves) | by tag: native **served** old digest, imagestream `manifest unknown`; by digest: same split | **accepted skew confirmed** — native serves deleted content until pruning (plan fact 6) |
+| 4b. `oc tag` move latest A→B | native vs imagestream | skew (native serves old) | native resolved **old** digest A, imagestream resolved **new** digest B | **accepted skew confirmed** — moved tag resolves stale natively |
+| 5. resolution metric | native registry | native hits + fallback for etcd-only tag | `tag_get{native}=1`, `tag_get{fallback}=1`, `manifest_get{native}=3`, `blob_stat{native}=17` | metric classifies native vs fallback correctly; etcd-only tag (created via image API) falls back as designed |
+
+Notes:
+
+- **Go/no-go criterion 2 (zero content diffs) is met** for registry-pushed
+  images: every native read was byte-identical to the imagestream read, by tag
+  and by digest, for both schema2 and OCI. Crossmount is explained (a blob-link
+  operation, orthogonal to native tag/manifest resolution) rather than broken.
+- **The two accepted skews are reproduced on a real cluster**, quantifying the
+  window the tombstone/generation design must drive to zero: after `oc tag -d`
+  or `oc tag`, native reads keep serving the old digest by tag and by digest
+  while the imagestream path already 404s or returns the new digest.
+- `blob_stat` resolutions are all `native` here because every blob was pushed
+  locally to its repo (repo layer-link hit); the `fallback` branch is only
+  taken on a repo-link miss, which this harness does not exercise.
+- The resolution counter is per-sink: only the metrics-enabled registry records,
+  so the metric test's counts are self-contained rather than accumulated across
+  the other tests.
+
 ## Open questions / next steps
 
 - **Workstream 2 (correctness harness, cluster).** Extend `test/integration/`:

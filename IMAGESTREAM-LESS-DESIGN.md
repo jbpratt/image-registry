@@ -207,6 +207,21 @@ minimal POC critical path (§3). Image-CR-sourced config metadata is dropped
 have no in-registry substitute — their absence is inherent to the mode, not a gap
 to close here.
 
+#### Reconciling `REFERRERS-PLAN.md` with this mode
+
+`REFERRERS-PLAN.md` is written against the ImageStream-backed registry: it makes a
+pushed referrer readable by having `GetImageOfImageStream` find it as a child of
+the tagged index via the imagestream layers API, and it stores the index through
+`manifestService.Put` with `WithTag`, which creates an `ImageStreamMapping`.
+Neither mechanism exists in the ImageStream-less profile, but the plan's core
+design is unchanged — the index is an ordinary manifest stored at the OCI fallback
+tag `sha256-<digest>`. Here that index is written and read through the same native
+manifest revision store and native `_manifests/tags` store this mode already uses,
+and `GET /referrers/<digest>` resolves the tag natively. So the signatures
+decision (referrers, not the Image CR) holds as written; only the index's
+storage/read path is native rather than imagestream-backed. Referrers stay
+sequenced after the push/pull POC and are not implemented here.
+
 ### 2e. What MicroShift already does (and whether this is "the MicroShift profile")
 
 Verified against `openshift/microshift` and `openshift/openshift-docs` source
